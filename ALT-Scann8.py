@@ -1555,7 +1555,7 @@ def rwnd_speed_up():
 
 def cmd_frame_extra_steps_selection():
     global FrameExtraStepsValue
-    FrameExtraStepsValue = value_normalize(frame_extra_steps_value, 0, 30, 0)
+    FrameExtraStepsValue = value_normalize(frame_extra_steps_value, 0, 150, 0)
     ConfigData["FrameExtraSteps"] = FrameExtraStepsValue
     send_arduino_command(CMD_SET_EXTRA_STEPS, FrameExtraStepsValue)
 
@@ -4072,7 +4072,7 @@ def load_session_data_post_init():
                     send_arduino_command(CMD_SET_FRAME_FINE_TUNE, FrameFineTuneValue)
                 if 'FrameExtraSteps' in ConfigData:
                     FrameExtraStepsValue = ConfigData["FrameExtraSteps"]
-                    FrameExtraStepsValue = min(FrameExtraStepsValue, 20)
+                    FrameExtraStepsValue = min(FrameExtraStepsValue, 150)
                     frame_extra_steps_value.set(FrameExtraStepsValue)
                     send_arduino_command(CMD_SET_EXTRA_STEPS, FrameExtraStepsValue)
                 if 'PTLevelAuto' in ConfigData:     # Delete legacy name, replace with new
