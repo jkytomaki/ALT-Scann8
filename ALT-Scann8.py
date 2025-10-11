@@ -4920,7 +4920,7 @@ def vcenter_validation(new_value):
 
 
 def extra_steps_validation(new_value):
-    return value_validation(new_value, frame_extra_steps_spinbox, -30, 30, 0)
+    return value_validation(new_value, frame_extra_steps_spinbox, -30, 150, 0)
 
 
 def cmd_scan_speed_selection():
@@ -6260,8 +6260,8 @@ def create_widgets():
         frame_extra_steps_label.grid(row=frame_align_row, column=0, padx=x_pad, pady=y_pad, sticky=E)
 
         frame_extra_steps_value = tk.IntVar(value=FrameExtraStepsValue)  # To be overridden by config
-        frame_extra_steps_spinbox = DynamicSpinbox(frame_alignment_frame, command=cmd_frame_extra_steps_selection, width=4,
-                                                   readonlybackground='pale green', from_=0, to=30,
+        frame_extra_steps_spinbox = DynamicSpinbox(frame_alignment_frame, command=cmd_frame_extra_steps_selection, width=5,
+                                                   readonlybackground='pale green', from_=0, to=150,
                                                    textvariable=frame_extra_steps_value, font=("Arial", FontSize - 1),
                                                    name='frame_extra_steps_spinbox')
         frame_extra_steps_spinbox.widget_type = "control"
