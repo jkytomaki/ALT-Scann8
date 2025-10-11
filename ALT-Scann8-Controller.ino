@@ -386,7 +386,7 @@ void loop() {
                 break;
             case CMD_SET_EXTRA_STEPS:
                 DebugPrint(">BoostPT", param);
-                if (param >= 1 && param <= 30)  // Also to move up we add extra steps
+                if (param >= 1 && param <= 150)  // Allow up to ~half frame advance for R8 alignment
                     FrameExtraSteps = param;
                 else if (param >= -30 && param <= -1)  // Manually force reduction of MinFrameSteps
                     FrameDeductSteps = param;
@@ -1093,7 +1093,7 @@ ScanResult scan(int UI_Command) {
 
         if (FrameDetected) {
             DebugPrintStr("Frame!");
-            if (Frame_Steps_Auto and FrameExtraSteps > 0)  // If auto steps enabled, and extra steps positive, aditional steps after detection
+            if (FrameExtraSteps > 0)  // Apply extra steps after detection (works in both auto and manual mode)
                 capstan_advance(FrameExtraSteps);
             LastFrameSteps = FrameStepsDone;
             adjust_framesteps(LastFrameSteps);
