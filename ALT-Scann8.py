@@ -3181,19 +3181,20 @@ def capture_loop():
             capture('normal')
             if FrameDetectMode == 'PFD':
                 if not SimulatedRun:
-                    try:
-                        # Set NewFrameAvailable to False here, to avoid overwriting new frame from arduino
-                        NewFrameAvailable = False
-                        logging.debug("Frame %i captured.", CurrentFrame)
-                        send_arduino_command(CMD_GET_NEXT_FRAME)  # Tell Arduino to move to next frame
+                    # Set NewFrameAvailable to False here, to avoid overwriting new frame from arduino
+                    NewFrameAvailable = False
+                    logging.debug("Frame %i captured.", CurrentFrame)
+                    # send_arduino_command() swallows the I2C IOError internally and reports it
+                    # via its return value, so check that instead of relying on an exception
+                    # (which never propagates out of send_arduino_command).
+                    if send_arduino_command(CMD_GET_NEXT_FRAME):  # Tell Arduino to move to next frame
                         RetryingFrame = False
-                    except IOError:
-                        # Retry the SAME frame without rolling back or re-advancing the
-                        # counters, so FramesToGo / session_frames are not double-counted
-                        # when this block runs again for the retry.
+                    else:
+                        # The command did not reach the Arduino, so the frame has NOT advanced.
+                        # Retry the SAME frame without rolling back or re-advancing the counters,
+                        # so FramesToGo / session_frames are not double-counted on the retry.
                         NewFrameAvailable = True  # Set NewFrameAvailable to True to repeat next time
                         RetryingFrame = True
-                        # Log error to console
                         logging.warning("Error while telling Arduino to move to next Frame.")
                         logging.warning("Frame %i capture to be tried again.", CurrentFrame)
                         win.after(5, capture_loop)
@@ -3399,11 +3400,12 @@ def send_arduino_command(cmd, param=0):
             i2c.write_i2c_block_data(16, cmd, [int(param % 256), int(param >> 8)])  # Send command to Arduino
         except IOError:
             logging.warning(
-                f"Error while sending command {cmd} (param {param}) to Arduino while handling frame {CurrentFrame}. "
-                f"Retrying...")
+                f"Error while sending command {cmd} (param {param}) to Arduino while handling frame {CurrentFrame}.")
             time.sleep(0.2)  # wait 100 µs, to avoid I/O errors
+            return False  # Report the failure; callers that must not miss the command can react
 
         time.sleep(0.0001)  # wait 100 µs, same
+    return True
 
 
 def arduino_listen_loop():  # Waits for Arduino communicated events and dispatches accordingly
