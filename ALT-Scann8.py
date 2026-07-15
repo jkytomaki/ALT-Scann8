@@ -3177,8 +3177,11 @@ def capture_loop():
                 CurrentFrame += 1
                 session_frames += 1
                 register_frame()
-            CurrentStill = 1
-            capture('normal')
+                CurrentStill = 1
+                capture('normal')
+            # On a retry (RetryingFrame) the frame was already captured and queued for
+            # saving on the first attempt, so we do NOT capture again - that would queue a
+            # second async save of the same filename. We only re-send the advance command.
             if FrameDetectMode == 'PFD':
                 if not SimulatedRun:
                     # Set NewFrameAvailable to False here, to avoid overwriting new frame from arduino
