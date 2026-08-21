@@ -862,12 +862,12 @@ def cmd_detect_misaligned_frames():
     global DetectMisalignedFrames, misaligned_tolerance_label
     DetectMisalignedFrames = detect_misaligned_frames.get()
     ConfigData["DetectMisalignedFrames"] = DetectMisalignedFrames
-    scan_error_counter_value_label.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+    if ExpertMode: scan_error_counter_value_label.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
 
 
 def cmd_select_file_type(selected):
     global FileType
-    misaligned_tolerance_label.config(state = NORMAL if detect_misaligned_frames.get() and (file_type_dropdown_selected.get() != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+    if ExpertMode: misaligned_tolerance_label.config(state = NORMAL if detect_misaligned_frames.get() and (file_type_dropdown_selected.get() != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
     misaligned_tolerance_spinbox.config(state = NORMAL if detect_misaligned_frames.get() and (file_type_dropdown_selected.get() != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
 
 
@@ -1005,8 +1005,8 @@ def cmd_settings_popup_accept():
     capture_info_str.set(f"{FileType} - {CaptureResolution}")
 
     if not SimplifiedMode:
-        detect_misaligned_frames_btn.config(state = NORMAL if (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
-        scan_error_counter_value_label.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+        if ExpertMode: detect_misaligned_frames_btn.config(state = NORMAL if (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+        if ExpertMode: scan_error_counter_value_label.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
 
     if DisableToolTips:
         as_tooltips.disable()
@@ -1195,7 +1195,7 @@ def cmd_settings_popup():
     options_ok_btn.grid(row=options_row, column=1, padx=10, pady=5, sticky='E')
 
     # arrange status for multidependent widgets. Initially enabled, increase counter for each disable condition   
-    misaligned_tolerance_label.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+    if ExpertMode: misaligned_tolerance_label.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
     misaligned_tolerance_spinbox.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
 
     options_dlg.protocol("WM_DELETE_WINDOW", cmd_settings_popup_dismiss)  # intercept close button
@@ -2301,7 +2301,7 @@ def cmd_set_s8():
 
     PTLevel = PTLevelS8
     FrameVCenterImageShift = FrameVCenterImageShiftS8
-    frame_vcenter_value.set(FrameVCenterImageShift)
+    if ExpertMode: frame_vcenter_value.set(FrameVCenterImageShift)
     MinFrameSteps = MinFrameStepsS8
     if ALT_scann_init_done:
         ConfigData["PTLevel"] = PTLevel
@@ -2327,7 +2327,7 @@ def cmd_set_r8():
 
     PTLevel = PTLevelR8
     FrameVCenterImageShift = FrameVCenterImageShiftR8
-    frame_vcenter_value.set(FrameVCenterImageShift)
+    if ExpertMode: frame_vcenter_value.set(FrameVCenterImageShift)
     MinFrameSteps = MinFrameStepsR8
     if ALT_scann_init_done:
         ConfigData["PTLevel"] = PTLevel
@@ -4176,7 +4176,7 @@ def load_session_data_post_init():
         widget_list_enable([id_ManualScanEnabled, id_AutoStopEnabled, id_ExposureWbAdaptPause, 
                             id_HdrCaptureActive, id_HdrBracketAuto])
         if not SimplifiedMode:
-            scan_error_counter_value_label.config(state=NORMAL if DetectMisalignedFrames else DISABLED)
+            if ExpertMode: scan_error_counter_value_label.config(state=NORMAL if DetectMisalignedFrames else DISABLED)
 
         # Display current capture settings as loaded from file
         capture_info_str.set(f"{FileType} - {CaptureResolution}")
@@ -6603,6 +6603,11 @@ def create_widgets():
     win.update()
     app_width = min(main_container.winfo_reqwidth(), screen_width - 150)
     app_height = min(main_container.winfo_reqheight(), screen_height - 150) + menu_bar.winfo_reqheight()
+    if not ExpertMode:
+        # Expert-area widgets are not created, but their tk variables are used elsewhere
+        scan_error_counter_value = tk.StringVar(value="0 (0%)")
+        frame_vcenter_value = tk.IntVar(value=FrameVCenterImageShift)
+
     if ExpertMode and extended_frame.winfo_reqwidth() > top_area_frame.winfo_reqwidth():
         x = int((extended_frame.winfo_reqwidth() - top_area_frame.winfo_reqwidth()) / 2)
         top_area_frame.config(padx=x-1)
