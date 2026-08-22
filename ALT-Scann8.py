@@ -4220,7 +4220,7 @@ def PiCam2_change_resolution():
     capture_config["main"]["size"] = camera_resolutions.get_image_resolution()
     # capture_config["main"]["format"] = camera_resolutions.get_format()
     capture_config["raw"]["size"] = camera_resolutions.get_sensor_resolution()
-    capture_config["raw"]["format"] = camera_resolutions.get_format().replace("_CSI2P", "")
+    capture_config["raw"]["format"] = camera_resolutions.get_unpacked_format()
     camera.stop()
     camera.configure(capture_config)
     camera.start()
@@ -4242,7 +4242,7 @@ def PiCam2_configure():
                                                        # not supported by the Pi 5 pipeline, which silently substitutes
                                                        # the lossy-compressed PISP_COMP1 format, degrading DNG output.
                                                        raw={"size": camera_resolutions.get_sensor_resolution(),
-                                                            "format": camera_resolutions.get_format().replace("_CSI2P", "")},
+                                                            "format": camera_resolutions.get_unpacked_format()},
                                                        transform=Transform(hflip=True))
 
     preview_config = camera.create_preview_configuration({"size": (2028, 1520)}, transform=Transform(hflip=True))
