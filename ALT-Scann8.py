@@ -4233,10 +4233,16 @@ def PiCam2_configure():
     global capture_config, preview_config, vfd_config
 
     camera.stop()
+    # buffer_count > 1 keeps the camera pipeline streaming between captures
+    # (a single buffer forces a full pipeline round trip per request), and
+    # queue=False makes each capture wait for a frame exposed after the request
+    # was made - so a capture right after film transport cannot return a frame
+    # exposed while the film was still moving.
     capture_config = camera.create_still_configuration(main={"size": camera_resolutions.get_sensor_resolution()},
                                                        raw={"size": camera_resolutions.get_sensor_resolution(),
                                                             "format": camera_resolutions.get_format()},
-                                                       transform=Transform(hflip=True))
+                                                       transform=Transform(hflip=True),
+                                                       buffer_count=3, queue=False)
 
     preview_config = camera.create_preview_configuration({"size": (2028, 1520)}, transform=Transform(hflip=True))
     vfd_config = camera.create_preview_configuration({"size": (1332, 990)}, transform=Transform(hflip=True))
