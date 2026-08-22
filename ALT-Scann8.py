@@ -450,6 +450,9 @@ total_wait_time_save_image = 0
 total_wait_time_preview_display = 0
 total_wait_time_awb = 0
 total_wait_time_autoexp = 0
+# Latest camera metadata, cached by a picamera2 post_callback on every completed
+# request, so status reads do not need a blocking capture_metadata() call
+LastCameraMetadata = None
 time_save_image = None
 time_preview_display = None
 time_awb = None
@@ -2642,7 +2645,12 @@ def capture(mode):
         curtime = time.time()
         wait_loop_count = 0
         while True:  # In case of exposure change, give time for the camera to adapt
-            metadata = camera.capture_metadata()
+            if ExposureWbAdaptPause or LastCameraMetadata is None:
+                metadata = camera.capture_metadata()
+            else:
+                # Not waiting for a match: the cached metadata from the last
+                # completed frame is enough, no need to block for a new one
+                metadata = LastCameraMetadata
             aux_current_exposure = metadata["ExposureTime"]
             if ExposureWbAdaptPause:
                 # With PiCamera2, exposure was changing too often, so level changed from 1000 to 2000, then to 4000
@@ -2678,7 +2686,10 @@ def capture(mode):
         curtime = time.time()
         wait_loop_count = 0
         while True:  # In case of exposure change, give time for the camera to adapt
-            metadata = camera.capture_metadata()
+            if ExposureWbAdaptPause or LastCameraMetadata is None:
+                metadata = camera.capture_metadata()
+            else:
+                metadata = LastCameraMetadata
             camera_colour_gains = metadata["ColourGains"]
             aux_gain_red = camera_colour_gains[0]
             aux_gain_blue = camera_colour_gains[1]
@@ -4243,6 +4254,12 @@ def PiCam2_change_resolution():
 
 
 
+def camera_metadata_callback(request):
+    # Runs in the camera event loop for every completed request
+    global LastCameraMetadata
+    LastCameraMetadata = request.get_metadata()
+
+
 def PiCam2_configure():
     global capture_config, preview_config, vfd_config
 
@@ -4516,6 +4533,7 @@ def tscann8_init():
         camera_resolutions = CameraResolutions(camera.sensor_modes)
         logging.info(f"Camera Sensor modes: {camera.sensor_modes}")
         PiCam2_configure()
+        camera.post_callback = camera_metadata_callback
         ZoomSize = camera.capture_metadata()['ScalerCrop']
         logging.debug(f"ScalerCrop: {ZoomSize}")
     if SimulatedRun:
