@@ -43,7 +43,12 @@ class CameraResolutions():
                 key = f"{mode['size'][0]}x{mode['size'][1]}"
                 if mode['crop_limits'][0] != 0 or mode['crop_limits'][1] != 0:
                     key = key + ' *'
+                # Recent kernels list each size at several bit depths; keep only the
+                # highest one so lower-depth entries cannot overwrite it
+                if key in self.resolution_dict and self.resolution_dict[key]['bit_depth'] >= mode['bit_depth']:
+                    continue
                 self.resolution_dict[key] = {}
+                self.resolution_dict[key]['bit_depth'] = mode['bit_depth']
                 self.resolution_dict[key]['sensor_resolution'] = mode['size']
                 self.resolution_dict[key]['image_resolution'] = mode['size']
                 if 1024 < mode['size'][0] < aux_width and 768 < mode['size'][1] < aux_height:
@@ -51,6 +56,7 @@ class CameraResolutions():
                     aux_height = mode['size'][1]
                     aux_key = key
                 self.resolution_dict[key]['format'] = mode['format'].format
+                self.resolution_dict[key]['unpacked_format'] = mode['unpacked']
                 # self.resolution_dict[key]['min_exp'] = mode['exposure_limits'][0]
                 # self.resolution_dict[key]['max_exp'] = mode['exposure_limits'][1]
                 # Force lower exposure range 0-1sec
@@ -65,12 +71,14 @@ class CameraResolutions():
                 self.resolution_dict['1024x768 *']['min_exp'] = aux_entry['min_exp']
                 self.resolution_dict['1024x768 *']['max_exp'] = aux_entry['max_exp']
                 self.resolution_dict['1024x768 *']['format'] = aux_entry['format']
+                self.resolution_dict['1024x768 *']['unpacked_format'] = aux_entry['unpacked_format']
                 self.resolution_dict['640x480 *'] = {}
                 self.resolution_dict['640x480 *']['sensor_resolution'] = aux_entry['sensor_resolution']
                 self.resolution_dict['640x480 *']['image_resolution'] = (640, 480)
                 self.resolution_dict['640x480 *']['min_exp'] = aux_entry['min_exp']
                 self.resolution_dict['640x480 *']['max_exp'] = aux_entry['max_exp']
                 self.resolution_dict['640x480 *']['format'] = aux_entry['format']
+                self.resolution_dict['640x480 *']['unpacked_format'] = aux_entry['unpacked_format']
 
             first_entry_key = next(iter(self.resolution_dict))  # Get the key of the first entry
             self.active = self.resolution_dict[first_entry_key]
@@ -84,6 +92,12 @@ class CameraResolutions():
             return self.active['format']
         else:
             return self.resolution_dict[resolution]['format']
+
+    def get_unpacked_format(self, resolution=None):
+        if resolution is None:
+            return self.active['unpacked_format']
+        else:
+            return self.resolution_dict[resolution]['unpacked_format']
 
     def get_sensor_resolution(self, resolution=None):
         if resolution is None:
