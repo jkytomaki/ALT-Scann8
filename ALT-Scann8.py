@@ -5379,16 +5379,21 @@ def create_widgets():
 
     # Frame for single step/snapshot
     sstep_area_frame = Frame(top_left_area_frame, name='sstep_area_frame')
-    sstep_area_frame.grid_forget()
+    sstep_area_frame.grid(row=bottom_area_row, column=bottom_area_column, columnspan=2, sticky='NSEW')
+    sstep_area_frame.columnconfigure(0, weight=1)
+    sstep_area_frame.columnconfigure(1, weight=1)
+    bottom_area_row += 1
     # Advance one single frame
     singleStep_btn = Button(sstep_area_frame, text="Single Step", command=cmd_single_step_movie,
                             activebackground='#f0f0f0', font=("Arial", FontSize), name='singleStep_btn')
     singleStep_btn.widget_type = "general"
-    singleStep_btn.grid_forget()
+    singleStep_btn.grid(row=0, column=0, padx=x_pad, pady=y_pad, sticky='NSEW')
+    as_tooltips.add(singleStep_btn, "Advance the film by one single frame.")
     snapshot_btn = Button(sstep_area_frame, text="Snapshot", command=cmd_capture_single_step,
                           activebackground='#f0f0f0', font=("Arial", FontSize), name='snapshot_btn')
     snapshot_btn.widget_type = "general"
-    snapshot_btn.grid_forget()
+    snapshot_btn.grid(row=0, column=1, padx=x_pad, pady=y_pad, sticky='NSEW')
+    as_tooltips.add(snapshot_btn, "Capture the current frame as a still picture, without advancing the film.")
 
     # Rewind movie (via upper path, outside of film gate)
     rewind_btn = Button(top_left_area_frame, text="◀◀", font=("Arial", FontSize + 3), height=2, command=cmd_rewind_movie,
