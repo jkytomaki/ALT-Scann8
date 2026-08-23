@@ -4302,19 +4302,20 @@ def on_configure_scrolled_canvas(event):
 
 # Initialize widgets with multiple dependencies
 def init_multidependent_widgets():
-    if HdrCaptureActive == HdrBracketAuto and HdrBracketAuto:
+    if ExperimentalMode and HdrCaptureActive == HdrBracketAuto and HdrBracketAuto:
         hdr_min_exp_label.disabled_counter = 1
         hdr_max_exp_label.disabled_counter = 1
         hdr_min_exp_spinbox.disabled_counter = 1
         hdr_max_exp_spinbox.disabled_counter = 1
 
-    frame_fine_tune_spinbox.disabled_counter = 0
-    if not AutoPtLevelEnabled:
-        frame_fine_tune_spinbox.disabled_counter += 1
-    if  AutoFineTuneEnabled:
-        frame_fine_tune_spinbox.disabled_counter += 1
-    frame_vcenter_spinbox.disabled_counter = 1
-    
+    if ExpertMode:
+        frame_fine_tune_spinbox.disabled_counter = 0
+        if not AutoPtLevelEnabled:
+            frame_fine_tune_spinbox.disabled_counter += 1
+        if  AutoFineTuneEnabled:
+            frame_fine_tune_spinbox.disabled_counter += 1
+        frame_vcenter_spinbox.disabled_counter = 1
+
     widget_list_refresh([id_HdrBracketAuto, id_AutoPtLevelEnabled, id_AutoFineTuneEnabled, id_FrameVCenterEnabled])
 
 def display_splash():
