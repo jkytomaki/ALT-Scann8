@@ -1769,7 +1769,7 @@ def adjust_auto_fine_tune():
     if abs(offset_avg) < int(CaptureResolution.split("x")[1])*0.005:
         return  # Ignore if average offset is less than 0.5% of total height
     direction = 1 if offset_avg > 0 else -1
-    step = min(10, int(abs(offset_avg)/10)) # big steps for big offsets
+    step = min(10, max(1, int(abs(offset_avg)/10))) # big steps for big offsets, at least 1 once past the dead band
     FrameFineTuneValue += int(direction * step)
     if FrameFineTuneValue < 0:
         FrameFineTuneValue = 0
@@ -4835,6 +4835,7 @@ def draw_static_arrows(canvas, width, height):
 def cmd_set_frame_vcenter():
     global FrameVCenterEnabled, FrameVCenterImage, save_canvas_image
     global FrameVCenterHoleShift, FrameVCenterImageShift
+    global FrameVCenterImageShiftS8, FrameVCenterImageShiftR8
 
     if IsSplashDisplayed:
         tk.messagebox.showinfo(
@@ -4897,6 +4898,11 @@ def cmd_set_frame_vcenter():
         # First, draw back S8/R8 markers
         display_left_markers()
         ConfigData["FrameVCenterImageShift" + ConfigData["FilmType"]] = FrameVCenterImageShift
+        # Keep the per-film-type value in sync, otherwise switching film type restores the stale startup value
+        if ConfigData["FilmType"] == "S8":
+            FrameVCenterImageShiftS8 = FrameVCenterImageShift
+        else:
+            FrameVCenterImageShiftR8 = FrameVCenterImageShift
         # Save image to restore it when done
         draw_capture_canvas.itemconfig(draw_capture_canvas_image_id, image=save_canvas_image)
         draw_capture_canvas.image = save_canvas_image
