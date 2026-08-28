@@ -1555,7 +1555,7 @@ def rwnd_speed_up():
 
 def cmd_frame_extra_steps_selection():
     global FrameExtraStepsValue
-    FrameExtraStepsValue = value_normalize(frame_extra_steps_value, 0, 30, 0)
+    FrameExtraStepsValue = value_normalize(frame_extra_steps_value, -30, 30, 0)
     ConfigData["FrameExtraSteps"] = FrameExtraStepsValue
     send_arduino_command(CMD_SET_EXTRA_STEPS, FrameExtraStepsValue)
 
@@ -4073,7 +4073,7 @@ def load_session_data_post_init():
                     send_arduino_command(CMD_SET_FRAME_FINE_TUNE, FrameFineTuneValue)
                 if 'FrameExtraSteps' in ConfigData:
                     FrameExtraStepsValue = ConfigData["FrameExtraSteps"]
-                    FrameExtraStepsValue = min(FrameExtraStepsValue, 20)
+                    FrameExtraStepsValue = max(-30, min(FrameExtraStepsValue, 30))
                     frame_extra_steps_value.set(FrameExtraStepsValue)
                     send_arduino_command(CMD_SET_EXTRA_STEPS, FrameExtraStepsValue)
                 if 'PTLevelAuto' in ConfigData:     # Delete legacy name, replace with new
@@ -6262,16 +6262,16 @@ def create_widgets():
 
         frame_extra_steps_value = tk.IntVar(value=FrameExtraStepsValue)  # To be overridden by config
         frame_extra_steps_spinbox = DynamicSpinbox(frame_alignment_frame, command=cmd_frame_extra_steps_selection, width=4,
-                                                   readonlybackground='pale green', from_=0, to=30,
+                                                   readonlybackground='pale green', from_=-30, to=30,
                                                    textvariable=frame_extra_steps_value, font=("Arial", FontSize - 1),
                                                    name='frame_extra_steps_spinbox')
         frame_extra_steps_spinbox.widget_type = "control"
         frame_extra_steps_spinbox.grid(row=frame_align_row, column=1, columnspan=2, padx=x_pad, pady=y_pad, sticky=E)
         cmd_extra_steps_validation_cmd = frame_extra_steps_spinbox.register(extra_steps_validation)
         frame_extra_steps_spinbox.configure(validate="key", validatecommand=(cmd_extra_steps_validation_cmd, '%P'))
-        as_tooltips.add(frame_extra_steps_spinbox, "Unconditionally advances/detects the frame n steps after/before "
-                                                   "detection (n between 0 and 30). Negative values can help if "
-                                                   "film gate is not correctly positioned.")
+        as_tooltips.add(frame_extra_steps_spinbox, "Unconditionally advances the frame n steps after detection "
+                                                   "(1 to 30). Negative values (-30 to -1) reduce the minimum steps "
+                                                   "per frame instead, can help if film gate is not correctly positioned.")
         frame_extra_steps_spinbox.bind("<FocusOut>", lambda event: cmd_frame_extra_steps_selection())
         frame_align_row += 1
 
