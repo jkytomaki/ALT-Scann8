@@ -340,6 +340,7 @@ ExposureWbAdaptPause = False
 AutoFineTuneEnabled = True
 offset_image = None # RollingAverage object to allow to automatically set the fine tune value
 auto_fine_tune_wait = 0 # To allow waiting a few frames to allow auto fine tune value to have an effect
+auto_fine_tune_limit_warned = False # To warn only once while auto fine tune is stuck at a range limit
 FrameVCenterEnabled = False
 FrameVCenterImage = None    # Used to temporarily save the imag eused to allow the user to vertically center the image
 FrameVCenterHoleShift = 0   # Offset of the hole center respect to the image center
@@ -1759,7 +1760,7 @@ def debug_display_image(window_name, img, factor=1):
 
 
 def adjust_auto_fine_tune():
-    global FrameFineTuneValue, PreviousFrameFineTuneValue, auto_fine_tune_wait
+    global FrameFineTuneValue, PreviousFrameFineTuneValue, auto_fine_tune_wait, auto_fine_tune_limit_warned
     offset_avg = offset_image.get_average()
     if offset_avg == None:
         return  # Too early as to rely on average (less than 50 samples)
@@ -1771,7 +1772,7 @@ def adjust_auto_fine_tune():
     if abs(offset_avg) < int(CaptureResolution.split("x")[1])*0.005:
         return  # Ignore if average offset is less than 0.5% of total height
     direction = 1 if offset_avg > 0 else -1
-    step = min(10, int(abs(offset_avg)/10)) # big steps for big offsets
+    step = min(10, max(1, int(abs(offset_avg)/10))) # big steps for big offsets, at least 1 once past the dead band
     FrameFineTuneValue += int(direction * step)
     if FrameFineTuneValue < 0:
         FrameFineTuneValue = 0
@@ -1779,9 +1780,14 @@ def adjust_auto_fine_tune():
         FrameFineTuneValue = 100
     if PreviousFrameFineTuneValue != FrameFineTuneValue:
         PreviousFrameFineTuneValue = FrameFineTuneValue
+        auto_fine_tune_limit_warned = False
         logging.debug(f"Average offset is {offset_avg}, adjusting fine tune value by {direction * step} to {FrameFineTuneValue}")
         send_arduino_command(CMD_SET_FRAME_FINE_TUNE, FrameFineTuneValue)
         frame_fine_tune_value.set(FrameFineTuneValue)
+    elif step > 0 and FrameFineTuneValue in (0, 100) and not auto_fine_tune_limit_warned:
+        auto_fine_tune_limit_warned = True
+        logging.warning(f"Auto fine tune stuck at limit ({FrameFineTuneValue}) with average offset {offset_avg}: "
+                        "cannot correct further, adjust steps per frame, extra steps or PT level")
     auto_fine_tune_wait = 2    # wait 5 frames to see the effect of this change
 
 
@@ -1807,7 +1813,11 @@ def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice
 
     # Adjust VCenter (not all films have the frames vertically centered respect to the holes)
     if compensate:
-        middle += FrameVCenterImageShift
+        # FrameVCenterImageShift is measured on the preview image, scale it to the height of the image being checked
+        if PreviewHeight > 0:
+            middle += int(FrameVCenterImageShift * height / PreviewHeight)
+        else:
+            middle += FrameVCenterImageShift
 
     # Calculate margin
     margin = height*threshold//100
@@ -4869,6 +4879,7 @@ def draw_static_arrows(canvas, width, height):
 def cmd_set_frame_vcenter():
     global FrameVCenterEnabled, FrameVCenterImage, save_canvas_image
     global FrameVCenterHoleShift, FrameVCenterImageShift
+    global FrameVCenterImageShiftS8, FrameVCenterImageShiftR8
 
     if IsSplashDisplayed:
         tk.messagebox.showinfo(
@@ -4899,8 +4910,8 @@ def cmd_set_frame_vcenter():
         width, height = FrameVCenterImage.size
         # Draw a line in the middle of the hole(s)
         draw = ImageDraw.Draw(FrameVCenterImage)
-        start_point = (0, height // 2 - FrameVCenterHoleShift)
-        end_point = (20, height // 2 - FrameVCenterHoleShift)
+        start_point = (0, height // 2 + FrameVCenterHoleShift)
+        end_point = (20, height // 2 + FrameVCenterHoleShift)
         line_color = (255, 0, 0)  # Red color (RGB)
         draw.line([start_point, end_point], fill=line_color, width=3)
         # Draw some explanatory text
@@ -4917,7 +4928,8 @@ def cmd_set_frame_vcenter():
         draw_outlined_text(draw, text_position, text_content, fill=text_color, outline_color="black", font=font)
         # Finally, add the line and text to the image
         new_image = Image.new("RGB", (width, height), (0, 0, 0, 0))  # Create new image.
-        new_image.paste(FrameVCenterImage, (0, FrameVCenterImageShift+FrameVCenterHoleShift))
+        # Shift image by -FrameVCenterHoleShift so hole center starts aligned with the reference line
+        new_image.paste(FrameVCenterImage, (0, FrameVCenterImageShift-FrameVCenterHoleShift))
         photo_image = ImageTk.PhotoImage(new_image)
         draw_capture_canvas.itemconfig(draw_capture_canvas_image_id, image=photo_image)
         draw_capture_canvas.image = photo_image
@@ -4926,10 +4938,15 @@ def cmd_set_frame_vcenter():
         if not hasattr(draw_capture_canvas, "arrows_drawn"):
             draw_static_arrows(draw_capture_canvas, width, height)
             draw_capture_canvas.arrows_drawn = True  # Set a flag so we don't draw them again
-    else:  # Button released, save final value (calculating proportion between previen and real image)
+    else:  # Button released, save final value (in preview pixels, scaled to real image height when applied)
         # First, draw back S8/R8 markers
         display_left_markers()
         ConfigData["FrameVCenterImageShift" + ConfigData["FilmType"]] = FrameVCenterImageShift
+        # Keep the per-film-type value in sync, otherwise switching film type restores the stale startup value
+        if ConfigData["FilmType"] == "S8":
+            FrameVCenterImageShiftS8 = FrameVCenterImageShift
+        else:
+            FrameVCenterImageShiftR8 = FrameVCenterImageShift
         # Save image to restore it when done
         draw_capture_canvas.itemconfig(draw_capture_canvas_image_id, image=save_canvas_image)
         draw_capture_canvas.image = save_canvas_image
@@ -4948,7 +4965,7 @@ def cmd_frame_vcenter_selection():
     # Arrange image according to user-defined displacement
     width, height = FrameVCenterImage.size
     new_image = Image.new("RGB", (width, height), (0, 0, 0, 0))  # Create new image.
-    new_image.paste(FrameVCenterImage, (0, FrameVCenterImageShift+FrameVCenterHoleShift))
+    new_image.paste(FrameVCenterImage, (0, FrameVCenterImageShift-FrameVCenterHoleShift))
     photo_image = ImageTk.PhotoImage(new_image)
     draw_capture_canvas.itemconfig(draw_capture_canvas_image_id, image=photo_image)
     draw_capture_canvas.image = photo_image
