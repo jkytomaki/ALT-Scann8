@@ -4896,6 +4896,10 @@ def cmd_set_frame_vcenter():
         # Convert RGB to BGR
         bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
         _, FrameVCenterHoleShift = is_frame_centered(bgr_image, FilmType, compensate=False)
+        # Temporary diagnostics: dump the exact analyzed image and result for column_probe.py
+        cv2.imwrite('/tmp/vcenter_input.png', bgr_image)
+        logging.warning(f"VCenter probe: analyzed image {bgr_image.shape[1]}x{bgr_image.shape[0]}, "
+                        f"detected hole shift {FrameVCenterHoleShift}")
         width, height = FrameVCenterImage.size
         # Draw a line in the middle of the hole(s)
         draw = ImageDraw.Draw(FrameVCenterImage)
