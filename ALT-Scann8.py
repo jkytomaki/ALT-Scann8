@@ -335,6 +335,7 @@ PreviousFrameFineTuneValue = 0
 FrameExtraStepsValue = 0
 ScanSpeedValue = 5
 StabilizationDelayValue = 100
+CaptureSettleDeadline = 0.0  # CLOCK_BOOTTIME time after which the film is considered settled
 ExposureWbAdaptPause = False
 # Variables to handle auto fine tune
 AutoFineTuneEnabled = True
@@ -2548,6 +2549,27 @@ def capture_hdr(mode):
         img.save(FrameFilenamePattern % (CurrentFrame, FileType), quality=95)
 
 
+def capture_settled_request():
+    # With queue=False the frame returned by capture_request may have started
+    # exposure up to one frame period before the request, i.e. before the
+    # stabilization delay elapsed, while the film was still settling. With a
+    # rolling shutter that shows as vertical stretch/compression of the frame.
+    # Discard frames whose exposure began before the settle deadline.
+    rejected = 0
+    while True:
+        request = camera.capture_request()
+        metadata = request.get_metadata()
+        exposure_start = (metadata['SensorTimestamp'] - metadata['ExposureTime'] * 1000) / 1e9
+        if exposure_start >= CaptureSettleDeadline or rejected >= 5:
+            if rejected:
+                logging.debug(f"Settle guard: discarded {rejected} early frame(s) for frame {CurrentFrame}")
+            if rejected >= 5:
+                logging.warning(f"Settle guard: giving up after {rejected} early frames, timestamps suspect")
+            return request
+        request.release()
+        rejected += 1
+
+
 def capture_single(mode):
     global CurrentFrame
     global total_wait_time_save_image, PreviewModuleValue
@@ -2562,7 +2584,7 @@ def capture_single(mode):
     curtime = time.time()
     if not DisableThreads:
         if is_dng or is_png:  # Save as request only for DNG captures
-            request = camera.capture_request()
+            request = capture_settled_request()
             # For PiCamera2, preview and save to file are handled in asynchronous threads
             if CurrentFrame % PreviewModuleValue == 0:
                 captured_image = request.make_image('main')
@@ -2595,7 +2617,7 @@ def capture_single(mode):
             Scanned_Images_number.set(CurrentFrame)
     else:
         if is_dng or is_png:
-            request = camera.capture_request()
+            request = capture_settled_request()
             if CurrentFrame % PreviewModuleValue == 0:
                 captured_image = request.make_image('main')
             else:
@@ -2632,9 +2654,14 @@ def capture(mode):
     global PreviousGainRed, PreviousGainBlue
     global total_wait_time_autoexp, total_wait_time_awb
     global CurrentStill
+    global CaptureSettleDeadline
 
     if SimulatedRun or CameraDisabled:
         return
+
+    # Film transport has just stopped; frames exposed before this deadline may
+    # be distorted by the rolling shutter (SensorTimestamp uses CLOCK_BOOTTIME)
+    CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME) + StabilizationDelayValue / 1000
 
     os.chdir(CurrentDir)
 
@@ -2731,7 +2758,11 @@ def capture(mode):
             camera.switch_mode_and_capture_file(capture_config, FrameFilenamePattern % CurrentFrame)
     else:
         # Allow time to stabilize image, it can get too fast with PiCamera2
-        time.sleep(StabilizationDelayValue/1000)
+        # DNG/PNG captures skip the fixed sleep: capture_settled_request waits
+        # for a frame exposed after the deadline instead, which both guarantees
+        # the settle time and starts the capture as early as possible
+        if mode == 'still' or HdrCaptureActive or FileType not in ('dng', 'png'):
+            time.sleep(StabilizationDelayValue/1000)
         if mode == 'still':
             captured_image = camera.capture_image("main")
             captured_image.save(StillFrameFilenamePattern % (CurrentFrame, CurrentStill))
