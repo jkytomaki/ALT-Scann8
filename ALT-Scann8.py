@@ -1793,10 +1793,12 @@ def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice
     height = img.shape[0]
     width = img.shape[1]
 
-    # Slice only the left part of the image
-    if slice_width > width:
+    # Slice a strip at the left part of the image, but not at the very edge: the backlight can
+    # leave a shadow on the leftmost columns of the hole area which breaks or biases detection
+    slice_start = int(width * 0.04)
+    if slice_start + slice_width > width:
         raise ValueError("Slice width exceeds image width")
-    sliced_image = img[:, :slice_width]
+    sliced_image = img[:, slice_start:slice_start + slice_width]
 
     # Convert to grayscale
     img = cv2.cvtColor(sliced_image, cv2.COLOR_BGR2GRAY)
@@ -1850,6 +1852,8 @@ def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice
         area_count += 1
         if area_count > 2:
             break
+        if end-start > height*0.9:  # A single area spanning the whole strip is not a hole, skip it
+            continue
         if end-start > bigger:
             bigger = end-start
             center = int((start + end) // 2)
