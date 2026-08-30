@@ -164,6 +164,7 @@ ScanOngoing = False  # PlayState in original code from Torulf (opposite meaning)
 FrameDetectMode = 'PFD'    # By default scanner works in traditional mode, with Phototransistor Frame Detection (vs VFD)
 ScanStopRequested = False  # To handle stopping scan process asynchronously, with same button as start scan
 NewFrameAvailable = False  # To be set to true upon reception of Arduino event
+RetryingFrame = False  # True while re-capturing a frame after an Arduino I/O error, to avoid re-counting it
 ScanProcessError = False  # To be set to true upon reception of Arduino event
 ScanProcessError_LastTime = 0
 # Directory where python scrips run, to store the json file with persistent data
@@ -1973,16 +1974,21 @@ def capture_save_thread(queue, event, id):
                     captured_image = np.array(captured_image)
                 logging.debug("Thread %i saved image: %s ms", id,
                               str(round((time.time() - curtime) * 1000, 1)))
-            frame_centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
-            offset_image.add_value(offset)
-            if AutoFineTuneEnabled:
-                adjust_auto_fine_tune()
-            if DetectMisalignedFrames and hdr_idx <= 1 and not frame_centered:
-                scan_error_counter += 1
-                if scan_error_total_frames_counter > 0:
-                    scan_error_counter_value.set(f"{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)")
-                with open(scan_error_log_fullpath, 'a') as f:
-                    f.write(f"Misaligned frame, {CurrentFrame}\n")
+            # captured_image is only bound for whole-image (IMAGE_TOKEN) frames or when
+            # misalignment detection asked for the array (REQUEST_TOKEN path). Guard the
+            # check so PNG or HDR sub-frame scans with detection off do not dereference an
+            # unbound captured_image here. Alignment only applies to the base frame (hdr_idx <= 1).
+            if hdr_idx <= 1 and (type == IMAGE_TOKEN or DetectMisalignedFrames):
+                frame_centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
+                offset_image.add_value(offset)
+                if AutoFineTuneEnabled:
+                    adjust_auto_fine_tune()
+                if DetectMisalignedFrames and not frame_centered:
+                    scan_error_counter += 1
+                    if scan_error_total_frames_counter > 0:
+                        scan_error_counter_value.set(f"{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)")
+                    with open(scan_error_log_fullpath, 'a') as f:
+                        f.write(f"Misaligned frame, {frame_idx}\n")
             logging.debug("Thread %i after checking misaligned frames", id)
         aux = time.time() - curtime
         total_wait_time_save_image += aux
@@ -2994,7 +3000,7 @@ def start_scan():
     global ScanOngoing
     global CurrentScanStartFrame, CurrentScanStartTime
     global ScanStopRequested
-    global NewFrameAvailable
+    global NewFrameAvailable, RetryingFrame
     global total_wait_time_autoexp, total_wait_time_awb, total_wait_time_preview_display, session_start_time
     global total_wait_time_save_image
     global session_frames
@@ -3038,6 +3044,10 @@ def start_scan():
         # Set new frame indicator to false, in case this is the cause of the strange
         # behaviour after stopping/restarting the scan process
         NewFrameAvailable = False
+        # Clear any stop/retry request left over from a previous (or aborted) scan, so a
+        # stale flag cannot immediately stop this one on the first capture_loop iteration.
+        ScanStopRequested = False
+        RetryingFrame = False
 
         # Enable/Disable related buttons
         except_widget_global_enable([start_btn], not ScanOngoing)
@@ -3088,7 +3098,7 @@ def capture_loop():
     global win
     global CurrentFrame
     global FramesPerMinute, FramesToGo
-    global NewFrameAvailable
+    global NewFrameAvailable, RetryingFrame
     global ScanProcessError, ScanProcessError_LastTime
     global ScanStopRequested
     global session_frames, CurrentStill
@@ -3194,38 +3204,52 @@ def capture_loop():
                 vfd_attempts_on_same_frame = 0
             # If centered, or gone too far, or offset too small to handle, let the code flow in the standard flow to do the normal capture
         if NewFrameAvailable:
-            # Update remaining time
-            aux = frames_to_go_str.get()
-            if aux.isdigit() and time.time() > frames_to_go_key_press_time:
-                FramesToGo = int(aux)
-                if FramesToGo > 0:
-                    FramesToGo -= 1
-                    frames_to_go_str.set(str(FramesToGo))
-                    ConfigData["FramesToGo"] = FramesToGo
-                    if FramesPerMinute != 0:
-                        minutes_pending = FramesToGo // FramesPerMinute
-                        frames_to_go_time_str.set(f"{(minutes_pending // 60):02}h {(minutes_pending % 60):02}m")
-                else:
-                    if AutoStopEnabled and autostop_type.get() == "counter_to_zero":
-                        ScanStopRequested = True  # Stop in next capture loop
-                    ConfigData["FramesToGo"] = -1
-                    frames_to_go_str.set('')  # clear frames to go box to prevent it stops again in next scan
-            CurrentFrame += 1
-            session_frames += 1
-            register_frame()
-            CurrentStill = 1
-            capture('normal')
+            if not RetryingFrame:
+                # Update remaining time
+                aux = frames_to_go_str.get()
+                if aux.isdigit() and time.time() > frames_to_go_key_press_time:
+                    FramesToGo = int(aux)
+                    if FramesToGo > 0:
+                        FramesToGo -= 1
+                        frames_to_go_str.set(str(FramesToGo))
+                        ConfigData["FramesToGo"] = FramesToGo
+                        if FramesPerMinute != 0:
+                            minutes_pending = FramesToGo // FramesPerMinute
+                            frames_to_go_time_str.set(f"{(minutes_pending // 60):02}h {(minutes_pending % 60):02}m")
+                    else:
+                        # Requested frame count reached: clear the box and, if auto-stop is
+                        # armed, stop now WITHOUT capturing an extra frame (this block used
+                        # to fall through and grab one frame beyond the requested count).
+                        ConfigData["FramesToGo"] = -1
+                        frames_to_go_str.set('')  # clear frames to go box to prevent it stops again in next scan
+                        if AutoStopEnabled and autostop_type.get() == "counter_to_zero":
+                            ScanStopRequested = True  # Stop in next capture loop
+                            win.after(5, capture_loop)
+                            return
+                CurrentFrame += 1
+                session_frames += 1
+                register_frame()
+                CurrentStill = 1
+                capture('normal')
+            # On a retry (RetryingFrame) the frame was already captured and queued for
+            # saving on the first attempt, so we do NOT capture again - that would queue a
+            # second async save of the same filename. We only re-send the advance command.
             if FrameDetectMode == 'PFD':
                 if not SimulatedRun:
-                    try:
-                        # Set NewFrameAvailable to False here, to avoid overwriting new frame from arduino
-                        NewFrameAvailable = False
-                        logging.debug("Frame %i captured.", CurrentFrame)
-                        send_arduino_command(CMD_GET_NEXT_FRAME)  # Tell Arduino to move to next frame
-                    except IOError:
-                        CurrentFrame -= 1
+                    # Set NewFrameAvailable to False here, to avoid overwriting new frame from arduino
+                    NewFrameAvailable = False
+                    logging.debug("Frame %i captured.", CurrentFrame)
+                    # send_arduino_command() swallows the I2C IOError internally and reports it
+                    # via its return value, so check that instead of relying on an exception
+                    # (which never propagates out of send_arduino_command).
+                    if send_arduino_command(CMD_GET_NEXT_FRAME):  # Tell Arduino to move to next frame
+                        RetryingFrame = False
+                    else:
+                        # The command did not reach the Arduino, so the frame has NOT advanced.
+                        # Retry the SAME frame without rolling back or re-advancing the counters,
+                        # so FramesToGo / session_frames are not double-counted on the retry.
                         NewFrameAvailable = True  # Set NewFrameAvailable to True to repeat next time
-                        # Log error to console
+                        RetryingFrame = True
                         logging.warning("Error while telling Arduino to move to next Frame.")
                         logging.warning("Frame %i capture to be tried again.", CurrentFrame)
                         win.after(5, capture_loop)
@@ -3431,11 +3455,12 @@ def send_arduino_command(cmd, param=0):
             i2c.write_i2c_block_data(16, cmd, [int(param % 256), int(param >> 8)])  # Send command to Arduino
         except IOError:
             logging.warning(
-                f"Error while sending command {cmd} (param {param}) to Arduino while handling frame {CurrentFrame}. "
-                f"Retrying...")
+                f"Error while sending command {cmd} (param {param}) to Arduino while handling frame {CurrentFrame}.")
             time.sleep(0.2)  # wait 100 µs, to avoid I/O errors
+            return False  # Report the failure; callers that must not miss the command can react
 
         time.sleep(0.0001)  # wait 100 µs, same
+    return True
 
 
 def arduino_listen_loop():  # Waits for Arduino communicated events and dispatches accordingly
@@ -3518,7 +3543,8 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
             f.write(f"No Frame detected, {CurrentFrame}, {ArduinoParam1}, {ArduinoParam2}\n")
     elif ArduinoTrigger == RSP_SCAN_ENDED:  # Scan arrived at the end of the reel
         logging.warning("End of reel reached: Scan terminated")
-        ScanStopRequested = True
+        if ScanOngoing:  # Only act if a scan is actually running; otherwise a late/spurious
+            ScanStopRequested = True  # end-of-reel event would arm the flag for the next scan
     elif ArduinoTrigger == RSP_REPORT_AUTO_LEVELS:  # Get auto levels from Arduino, to be displayed in UI, if auto on
         if ExpertMode:
             if (AutoPtLevelEnabled):
