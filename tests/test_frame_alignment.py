@@ -13,6 +13,7 @@ import cv2
 import numpy as np
 from PIL import Image
 from rolling_average import RollingAverage
+from frame_alignment import AlignmentGuard, HoleMeasurement, measure_hole
 
 SOURCE = Path(__file__).resolve().parents[1] / 'ALT-Scann8.py'
 
@@ -79,13 +80,13 @@ class SaveTests(unittest.TestCase):
         ns['capture_save_thread'](work, threading.Event(), 1)
         return request, average, adjust, log, ns
 
-    def test_dng_and_png_auto_tune_without_error_reporting_or_rawpy(self):
+    def test_save_workers_never_drive_transport_feedback(self):
         for file_type in ['dng', 'png']:
             with self.subTest(file_type=file_type):
-                request, average, adjust, _, _ = self.run_save(file_type=file_type)
+                request, average, adjust, _, _ = self.run_save(file_type=file_type, detect=True)
                 request.make_array.assert_called_once_with('main')
-                self.assertEqual(average.get_average(), 300)
-                adjust.assert_called_once()
+                self.assertIsNone(average.get_average())
+                adjust.assert_not_called()
                 request.release.assert_called_once()
 
     def test_missing_detection_never_enters_average(self):
@@ -101,6 +102,94 @@ class SaveTests(unittest.TestCase):
         request, _, adjust, _, _ = self.run_save(hdr_idx=2)
         request.make_array.assert_not_called()
         adjust.assert_not_called()
+
+
+
+
+class GuardTests(unittest.TestCase):
+    def test_confirms_on_same_film_frame_then_pauses(self):
+        guard = AlignmentGuard(3)
+        self.assertEqual(guard.inspect(HoleMeasurement(200, 1000)), 'confirm')
+        self.assertEqual(guard.inspect(HoleMeasurement(200, 1000)), 'pause')
+
+    def test_transient_measurement_does_not_force_pause(self):
+        guard = AlignmentGuard(3)
+        self.assertEqual(guard.inspect(HoleMeasurement(None, 1000)), 'confirm')
+        self.assertEqual(guard.inspect(HoleMeasurement(5, 1000)), 'accept')
+
+    def test_rejects_clipped_or_ambiguous_holes(self):
+        for spans in [[(0, 200)], [(200, 400), (600, 800)]]:
+            img = np.zeros((1000, 1000, 3), np.uint8)
+            for start, end in spans:
+                img[start:end, 20:70] = 255
+            self.assertIsNone(measure_hole(img, 'S8').offset)
+
+    def test_strips_agree_despite_one_shadowed_strip(self):
+        img = np.zeros((1000, 1000, 3), np.uint8)
+        img[600:800, 40:70] = 255
+        self.assertAlmostEqual(measure_hole(img, 'S8').offset, 199.5)
+
+    def test_scan_does_not_count_save_or_advance_rejected_frame(self):
+        ns = scanner_functions('capture_loop', ScanStopRequested=False, ScanOngoing=True,
+            alignment_paused=False, FrameDetectMode='PFD', NewFrameAvailable=True, RetryingFrame=False,
+            prepare_alignment_frame=Mock(return_value=False), win=Mock(), CurrentFrame=42,
+            capture=Mock(), send_arduino_command=Mock())
+        ns['capture_loop']()
+        self.assertEqual(ns['CurrentFrame'], 42)
+        ns['capture'].assert_not_called()
+        ns['send_arduino_command'].assert_not_called()
+
+
+class PreflightTests(unittest.TestCase):
+    def preflight(self, measurements, mode='Pause', stale=False):
+        requests = []
+        for _ in measurements:
+            request = Mock()
+            request.get_metadata.return_value = dict(SensorTimestamp=0 if stale else 10**20, ExposureTime=10000)
+            request.make_array.return_value = np.zeros((1000, 1000, 3), np.uint8)
+            requests.append(request)
+        average = RollingAverage(5)
+        ns = scanner_functions('prepare_alignment_frame', 'take_alignment_request',
+            alignment_guard=None, alignment_request=None, SimulatedRun=False, CameraDisabled=False,
+            AlignmentGuardMode=mode, AlignmentGuardTolerance=3, AlignmentGuard=AlignmentGuard,
+            AutoFineTuneEnabled=True, StabilizationDelayValue=0, CaptureSettleDeadline=0,
+            capture_settled_request=Mock(side_effect=requests), FrameVCenterImageShift=0,
+            PreviewHeight=500, FilmType='S8', measure_hole=Mock(side_effect=measurements),
+            offset_image=average, CaptureResolution='4056x3040', adjust_auto_fine_tune=Mock(),
+            set_alignment_status=Mock(), pause_alignment_frame=Mock())
+        return ns, requests
+
+    def test_dng_feedback_runs_without_reporting_or_rawpy(self):
+        ns, requests = self.preflight([HoleMeasurement(20, 1000)], mode='Off')
+        self.assertTrue(ns['prepare_alignment_frame']())
+        ns['adjust_auto_fine_tune'].assert_called_once()
+        self.assertAlmostEqual(ns['offset_image'].get_average(), 60.8)
+        self.assertIs(ns['take_alignment_request'](), requests[0])
+        self.assertIsNone(ns['alignment_request'])
+        requests[0].release.assert_not_called()
+
+    def test_confirmation_exposures_released_without_counting_as_film_frames(self):
+        ns, requests = self.preflight([HoleMeasurement(200, 1000), HoleMeasurement(200, 1000)])
+        self.assertFalse(ns['prepare_alignment_frame']())
+        self.assertFalse(ns['prepare_alignment_frame']())
+        ns['pause_alignment_frame'].assert_called_once()
+        ns['adjust_auto_fine_tune'].assert_called_once()
+        self.assertEqual(len(ns['offset_image'].window), 1)
+        for request in requests:
+            request.release.assert_called_once()
+
+    def test_unknown_never_feeds_trim_loop(self):
+        ns, _ = self.preflight([HoleMeasurement(None, 1000)], mode='Off')
+        self.assertTrue(ns['prepare_alignment_frame']())
+        ns['adjust_auto_fine_tune'].assert_not_called()
+        self.assertIsNone(ns['offset_image'].get_average())
+
+    def test_stale_exposure_pauses_instead_of_failing_open(self):
+        ns, requests = self.preflight([HoleMeasurement(0, 1000)], stale=True)
+        self.assertFalse(ns['prepare_alignment_frame']())
+        ns['pause_alignment_frame'].assert_called_once()
+        requests[0].release.assert_called_once()
+        ns['measure_hole'].assert_not_called()
 
 
 if __name__ == '__main__':
