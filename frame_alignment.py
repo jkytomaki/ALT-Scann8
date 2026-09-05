@@ -10,6 +10,7 @@ class HoleMeasurement:
     offset: float | None
     height: int
     reason: str = ''
+    source: str = 'strips'
 
 
 def measure_hole(image, film_type, target_shift=0):
@@ -47,8 +48,45 @@ def measure_hole(image, film_type, target_shift=0):
         pairs = [(a, b) for a, b in zip(centers, centers[1:]) if b - a <= agreement]
         centers = list(pairs[0]) if len(pairs) == 1 else []
     if len(centers) < 2:
-        return HoleMeasurement(None, height, 'No unambiguous complete sprocket detected')
+        return measure_adaptive_hole(image, film_type, target_shift)
     return HoleMeasurement(float(np.median(centers)) - height / 2 - target_shift, height)
+
+
+def measure_adaptive_hole(image, film_type, target_shift=0):
+    """Find a clean interior band; require agreement on BOTH edges across it.
+
+    Three non-overlapping strips spanning 1% of image width must support the
+    same complete hole. Competing supported bands make the result unknown.
+    Search stays inside the sprocket region, away from picture content.
+    """
+    height, width = image.shape[:2]
+    samples = []
+    for fraction in np.arange(0.005, 0.061, 0.005):
+        x = round(width * fraction)
+        strip = image[:, x:x + max(1, round(width * 0.0025))]
+        gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
+        areas = []
+        if int(gray.max()) - int(gray.min()) >= 20:
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            mask = np.mean(binary > 0, axis=1) >= 0.5
+            if film_type == 'R8':
+                mask = ~mask
+            edges = np.diff(np.r_[False, mask, False].astype(np.int8))
+            areas = [(a, b) for a, b in zip(np.where(edges == 1)[0], np.where(edges == -1)[0])
+                     if 0 < a and b < height and 0.08 * height < b - a < 0.8 * height]
+        samples.append(areas[0] if len(areas) == 1 else None)
+    supported = []
+    for i in range(len(samples) - 2):
+        band = samples[i:i + 3]
+        if any(v is None for v in band):
+            continue
+        if np.max(np.ptp(band, axis=0)) <= height * 0.015:
+            supported.append(np.median(band, axis=0))
+    if not supported or np.max(np.ptp(supported, axis=0)) > height * 0.015:
+        return HoleMeasurement(None, height, 'No unambiguous complete sprocket detected', 'adaptive')
+    start, end = np.median(supported, axis=0)
+    return HoleMeasurement(float((start + end - 1) / 2 - height / 2 - target_shift), height,
+                           source='adaptive')
 
 
 class AlignmentGuard:
@@ -64,11 +102,23 @@ class AlignmentGuard:
         self.next_steps = 0
         self.last_offset = None
         self.reason = ''
+        self.confirm_source = None
 
     def inspect(self, measurement):
         offset, height = measurement.offset, measurement.height
         # A nudge must not make an otherwise acceptable frame fail the guard.
         tolerance = height * self.tolerance_percent / 100
+        # A neural estimate must agree on two stationary exposures even when
+        # it already appears centered. Never feed an unconfirmed guess to motion.
+        if measurement.source == 'yolo' or self.confirm_source == 'yolo':
+            if not self.confirming:
+                self.confirming = True
+                self.confirm_offset = offset
+                self.confirm_source = measurement.source
+                return 'confirm'
+            if offset is None or self.confirm_offset is None or abs(offset - self.confirm_offset) > height * 0.015:
+                self.reason = measurement.reason or 'Stationary exposures disagree on YOLO sprocket position'
+                return 'pause'
         if offset is not None and abs(offset) <= tolerance:
             return 'accept'
         if not self.confirming:
@@ -99,4 +149,7 @@ class AlignmentGuard:
         self.last_offset = offset
         self.attempts += 1
         self.total_steps += self.next_steps
+        if measurement.source == 'yolo':
+            self.confirming = False
+            self.confirm_source = None
         return 'nudge'

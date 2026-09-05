@@ -27,17 +27,55 @@ recalibration. At least two of three detection strips must agree on a complete
 hole (S8) or gap (R8). One outlying strip is ignored only when the agreeing pair
 is unique. Clipped or ambiguous detections pause instead of driving the motor.
 
-A pause dialog offers **Retry this frame**, **Save this frame and stop**, and
+A pause dialog offers **Retry this frame**, **Save and continue**, **Save this frame and stop**, and
 **Stop without saving**. Retry rechecks the held physical frame without incrementing
 counters. Save explicitly accepts its position, uses the normal scan format and
-next frame number (including HDR when enabled), updates counters, and stops without
-advancing. Normal save workers finish writing queued exposures after stopping.
+next frame number (including HDR when enabled), and updates counters once.
+Save and continue advances after capture; an I2C send failure retries only the
+advance, without saving or counting again. An armed frame-count stop still stops
+after the last requested frame. Save this frame and stop keeps the film held.
+Normal save workers finish writing queued exposures after stopping.
 Stop without saving leaves this frame unsaved; a normal scan start requests a new
 film frame. Guard events include its intended filename in the scan error log.
 
 Normal DNG/PNG captures reuse the checked camera request. JPEG uses its RGB image.
 HDR and captures requesting exposure adaptation verify position first, then take
 their required exposures while the film stays stationary.
+
+### Damaged sprocket fallback
+
+If the usual three strips cannot agree, the detector searches 0.5–6% of the
+image width for a clean interior band. Three adjacent, non-overlapping strips
+must agree on both edges, within 1.5% of image height. Multiple supported bands
+with different edges remain unknown. The damaged sprocket in saved frame 1996
+is recovered this way: -36 pixels on a 1520-pixel-high DNG render (-2.37%).
+
+With the guard enabled, an unknown classical result invokes the optional
+NCNN YOLO11n fallback. It requires one complete corner pair, confidence at least
+0.65 for each corner, plausible geometry, and agreement across two stationary
+exposures. Neural measurements do not feed the automatic Fine Tune loop.
+One corner, a frame seam, missing runtime/model, an inference error, or a ten-second
+timeout cannot authorize movement or saving. Tk stays responsive during inference;
+stop/retry discards the result and releases the held camera request.
+
+The exported model and installation instructions are in
+[`models/sprocket-ncnn`](../models/sprocket-ncnn/README.md). No accelerator is required.
+On this 4 GB Pi 5 while scanning, eight saved-frame previews took 448 ms for the
+first inference, then 102–298 ms (median 118 ms) at 640×640 with two CPU threads.
+The strip detector took around 1 ms; the adaptive search on frame 1996 took 4.3 ms.
+These exclude decoding and camera acquisition. Full live camera buffers cost
+additional conversion/copy time, and a YOLO decision needs two exposures.
+
+The model accepted a complete pair on frame 146, agreeing with the classical
+center within one pixel. It declined the other seven sample frames, including
+1996 where only the top corner was confidently detected. This is a conservative
+fallback, not a guarantee that every damaged hole will be detected.
+
+Reproduce offline measurements without opening the camera or moving film:
+
+```sh
+.venv/bin/python tools/sprocket_bench.py /path/to/saved/frames/*.png
+```
 
 ### Live scan observations, 2026-09-05
 

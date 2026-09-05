@@ -31,7 +31,8 @@ def scanner_functions(*names, **state):
 
 class HeldFrameSaveTests(unittest.TestCase):
     def state(self):
-        ns = scanner_functions('save_alignment_frame_and_stop',
+        ns = scanner_functions('save_alignment_frame_and_stop', 'save_alignment_frame',
+            'save_alignment_frame_and_continue',
             ScanOngoing=True, alignment_paused=True, CurrentFrame=2, CurrentStill=1,
             session_frames=2, FramesToGo=8, NewFrameAvailable=True, RetryingFrame=False,
             ScanStopRequested=False, capture=Mock(), register_frame=Mock(),
@@ -39,7 +40,8 @@ class HeldFrameSaveTests(unittest.TestCase):
             datetime=datetime, CurrentDir='/scans', FilmType='S8',
             Scanned_Images_number=Mock(), scanned_Images_time_value=Mock(),
             stop_scan=Mock(), set_alignment_status=Mock(), tk=Mock(),
-            send_arduino_command=Mock())
+            send_arduino_command=Mock(), AutoStopEnabled=False, autostop_type=Mock(),
+            reset_alignment_guard=Mock(), win=Mock(), capture_loop=Mock())
         return ns
 
     def test_saves_next_number_and_stops_after_capture_without_moving(self):
@@ -250,7 +252,9 @@ class PreflightTests(unittest.TestCase):
             requests.append(request)
         average = RollingAverage(5)
         ns = scanner_functions('prepare_alignment_frame', 'take_alignment_request',
-            alignment_guard=None, alignment_request=None, SimulatedRun=False, CameraDisabled=False,
+            alignment_guard=None, alignment_request=None, alignment_yolo_pending=None,
+            alignment_yolo_worker=Mock(), HoleMeasurement=HoleMeasurement,
+            SimulatedRun=False, CameraDisabled=False,
             AlignmentGuardMode=mode, AlignmentGuardTolerance=3, AlignmentGuard=AlignmentGuard,
             AutoFineTuneEnabled=True, StabilizationDelayValue=0, CaptureSettleDeadline=0,
             capture_settled_request=Mock(side_effect=requests), FrameVCenterImageShift=0,

@@ -111,7 +111,8 @@ from camera_resolutions import CameraResolutions
 from dynamic_spinbox import DynamicSpinbox
 from tooltip import Tooltips
 from rolling_average import RollingAverage
-from frame_alignment import AlignmentGuard, measure_hole
+from frame_alignment import AlignmentGuard, HoleMeasurement, measure_hole
+from sprocket_yolo import YoloWorker
 
 #  ######### Global variable definition ##########
 win = None
@@ -347,6 +348,8 @@ alignment_move_pending = None
 alignment_move_result = None
 alignment_move_token = 0
 alignment_request = None
+alignment_yolo_pending = None
+alignment_yolo_worker = YoloWorker()
 alignment_paused = False
 alignment_pause_dialog = None
 alignment_guard_mode_var = None
@@ -2607,6 +2610,10 @@ def release_alignment_request():
 
 def reset_alignment_guard():
     global alignment_guard, alignment_paused, alignment_pause_dialog, alignment_move_pending, alignment_move_result
+    global alignment_yolo_pending
+    if alignment_yolo_pending is not None:
+        alignment_yolo_pending[0].release()
+        alignment_yolo_pending = None
     alignment_move_pending = None
     alignment_move_result = None
     release_alignment_request()
@@ -2629,13 +2636,22 @@ def stop_alignment_scan():
 
 
 def save_alignment_frame_and_stop():
-    """Accept the held position explicitly, capture normally, and never advance."""
+    save_alignment_frame(False)
+
+
+def save_alignment_frame_and_continue():
+    save_alignment_frame(True)
+
+
+def save_alignment_frame(continue_scan=False):
+    """Accept this position once, using the normal filename and capture path."""
     global CurrentFrame, CurrentStill, session_frames, FramesToGo
     global NewFrameAvailable, RetryingFrame, ScanStopRequested
     if not ScanOngoing or not alignment_paused:
         return
     previous_frame = CurrentFrame
     CurrentFrame += 1
+    session_frames += 1  # HDR exposure order must match the normal scan path.
     CurrentStill = 1
     try:
         # Keep the scan paused (and UV on) until all required exposures are taken.
@@ -2643,6 +2659,7 @@ def save_alignment_frame_and_stop():
         capture('normal')
     except Exception as error:
         CurrentFrame = previous_frame
+        session_frames -= 1
         ConfigData['CurrentFrame'] = str(CurrentFrame)
         logging.exception('Failed to capture held frame %s', CurrentFrame + 1)
         set_alignment_status(f'Capture failed; film still held: {error}')
@@ -2650,7 +2667,6 @@ def save_alignment_frame_and_stop():
                                 'The film is still held. Check the output files before retrying.\n'
                                 + str(error))
         return
-    session_frames += 1
     register_frame()
     remaining = frames_to_go_str.get()
     if remaining.isdigit() and int(remaining) > 0:
@@ -2665,9 +2681,21 @@ def save_alignment_frame_and_stop():
     scanned_Images_time_value.set(f'{(CurrentFrame // fps) // 60:02}:{(CurrentFrame // fps) % 60:02}')
     NewFrameAvailable = False
     RetryingFrame = False
-    ScanStopRequested = False
+    counter_finished = (remaining.isdigit() and int(remaining) <= 1
+                        and AutoStopEnabled and autostop_type.get() == 'counter_to_zero')
+    if continue_scan and not counter_finished and not ScanStopRequested:
+        reset_alignment_guard()
+        # The regular I2C retry path advances an already captured frame without
+        # saving/counting it again, including when the first send fails.
+        NewFrameAvailable = True
+        RetryingFrame = True
+        logging.info('Accepted held frame %s manually; continuing scan', CurrentFrame)
+        set_alignment_status(f'Frame {CurrentFrame} captured; continuing')
+        win.after(5, capture_loop)
+        return
     logging.info('Accepted held frame %s manually; stopping without advancing', CurrentFrame)
     stop_scan()
+    ScanStopRequested = False
     set_alignment_status(f'Frame {CurrentFrame} captured for normal saving; stopped without advancing')
 
 
@@ -2687,9 +2715,10 @@ def pause_alignment_frame(reason, image=None):
     alignment_pause_dialog.transient(win)
     tk.Label(alignment_pause_dialog, text=(
         f'{filename} has not been saved. The film is held at this frame.\n\n{reason}\n\n'
-        'Retry checks the same frame. Save uses the normal scan filename\n'
-        'and stops without advancing. Stop without saving leaves this frame unsaved.'), padx=16, pady=16).pack()
+        'Retry checks the same frame. Save uses the normal scan filename.\n'
+        'Choose whether to continue scanning or stop with the film held.'), padx=16, pady=16).pack()
     tk.Button(alignment_pause_dialog, text='Retry this frame', command=retry_alignment_frame).pack(side=LEFT, padx=16, pady=12)
+    tk.Button(alignment_pause_dialog, text='Save and continue', command=save_alignment_frame_and_continue).pack(side=LEFT, padx=8, pady=12)
     tk.Button(alignment_pause_dialog, text='Save this frame and stop', command=save_alignment_frame_and_stop).pack(side=LEFT, padx=8, pady=12)
     tk.Button(alignment_pause_dialog, text='Stop without saving', command=stop_alignment_scan).pack(side=RIGHT, padx=16, pady=12)
     alignment_pause_dialog.protocol('WM_DELETE_WINDOW', stop_alignment_scan)
@@ -2730,6 +2759,7 @@ def prepare_alignment_frame():
     """
     global alignment_guard, alignment_request, CaptureSettleDeadline
     global alignment_move_pending, alignment_move_result
+    global alignment_yolo_pending
     if SimulatedRun or CameraDisabled:
         return True
     if AlignmentGuardMode == 'Off' and not AutoFineTuneEnabled:
@@ -2755,18 +2785,39 @@ def prepare_alignment_frame():
         CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME) + StabilizationDelayValue / 1000
     request = None
     try:
-        request = capture_settled_request()
-        metadata = request.get_metadata()
-        exposure_start = (metadata['SensorTimestamp'] - metadata['ExposureTime'] * 1000) / 1e9
-        if exposure_start < CaptureSettleDeadline:
-            pause_alignment_frame('Camera did not provide a settled exposure')
-            return False
-        image = request.make_array('main')
-        height = image.shape[0]
-        shift = FrameVCenterImageShift * height / PreviewHeight if PreviewHeight > 0 else FrameVCenterImageShift
-        measurement = measure_hole(image, FilmType, shift)
+        if alignment_yolo_pending is not None:
+            held, future, deadline, height = alignment_yolo_pending
+            if not future.done() and time.monotonic() < deadline:
+                return False
+            request = held
+            alignment_yolo_pending = None
+            measurement = (future.result() if future.done() else
+                           HoleMeasurement(None, height, 'YOLO timed out; film remains held', 'yolo'))
+        else:
+            request = capture_settled_request()
+            metadata = request.get_metadata()
+            exposure_start = (metadata['SensorTimestamp'] - metadata['ExposureTime'] * 1000) / 1e9
+            if exposure_start < CaptureSettleDeadline:
+                pause_alignment_frame('Camera did not provide a settled exposure')
+                return False
+            image = request.make_array('main')
+            height = image.shape[0]
+            shift = FrameVCenterImageShift * height / PreviewHeight if PreviewHeight > 0 else FrameVCenterImageShift
+            measurement = measure_hole(image, FilmType, shift)
+            if measurement.offset is None and AlignmentGuardMode != 'Off':
+                # PIL normalizes the camera stream format to RGB. Inference
+                # runs on an owned copy while Tk keeps responding to Stop.
+                rgb = np.asarray(request.make_image('main').convert('RGB'))
+                future = alignment_yolo_worker.submit(rgb, FilmType, shift)
+                if future is None:
+                    pause_alignment_frame('YOLO is still busy; film remains held')
+                    return False
+                alignment_yolo_pending = (request, future, time.monotonic() + 10, height)
+                request = None
+                set_alignment_status(f'Checking damaged sprocket on frame {CurrentFrame + 1}')
+                return False
         first_measurement = not alignment_guard.confirming
-        if first_measurement and measurement.offset is not None and AutoFineTuneEnabled:
+        if first_measurement and measurement.offset is not None and AutoFineTuneEnabled and measurement.source != 'yolo':
             offset_image.add_value(measurement.offset * int(CaptureResolution.split('x')[1]) / height)
             adjust_auto_fine_tune()
         decision = 'accept' if AlignmentGuardMode == 'Off' else alignment_guard.inspect(measurement)
@@ -2781,6 +2832,8 @@ def prepare_alignment_frame():
                 set_alignment_status('Hole not found; auto fine tune has no feedback')
             else:
                 status = f'Offset {100 * measurement.offset / height:+.1f}%'
+                if measurement.source != 'strips':
+                    status += f' ({measurement.source})'
                 if AlignmentGuardMode == 'Correct' and not alignment_firmware_supported:
                     status += '; pause protection only'
                 if AutoFineTuneEnabled and auto_fine_tune_limit_warned:
