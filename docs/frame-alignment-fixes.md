@@ -65,10 +65,20 @@ arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328old \
   /tmp/alignment-nano/ALT-Scann8-Controller
 ```
 
-Flashing requires a USB serial connection to the Nano and a stopped scan. Deploying
-Python alone enables the fixes and pause protection; automatic nudging remains
-unavailable until the Nano update is installed. Restart the Pi app after deployment
-and check that the status says automatic correction is available.
+This scanner's PCB cannot safely have the external PSU and Nano USB power connected
+at the same time. For every Nano firmware update:
+
+1. Stop scanning and disconnect the external PSU.
+2. Connect the Nano by USB, then flash and verify the firmware.
+3. Disconnect USB before restoring external PSU power.
+4. Once the Pi is back online, restart the app and verify controller recognition.
+
+The Pi being unreachable during this procedure is expected; do not require it to
+be online for the USB flashing step.
+
+Deploying Python alone enables the fixes and pause protection; automatic nudging
+remains unavailable until the Nano update is installed. After restarting the app,
+check that the status says automatic correction is available.
 
 ## Validation
 
