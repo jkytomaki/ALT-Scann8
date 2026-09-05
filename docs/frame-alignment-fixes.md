@@ -162,6 +162,38 @@ check that the status says automatic correction is available.
 
 ## Validation
 
+### Alignment diagnostics
+
+The normal application log records these events at INFO, all using the intended
+next frame number (before it is saved):
+
+- `Alignment stop`: Nano-reported detection-interval steps, raw PT reading and
+  validity, latest reported PT threshold, step/Fine Tune settings and Auto flags,
+  Extra Steps, scan speed, settling delay, guard mode and tolerance.
+- `Alignment measurement`: initial, confirmation, or after-nudge exposure;
+  offset in pixels and percent, image height, detector source, sensor timestamp,
+  exposure duration, and any unknown-detection reason.
+- `Alignment fallback`: the classical detector failed and YOLO is being tried.
+- `Alignment nudge planned` / `send` / `ack`: starting offset, nudge number,
+  requested steps, command token, and controller-reported steps. Failed sends
+  and acknowledgement timeouts are also logged.
+- `Alignment nudge result`: offsets before and after each move and their signed
+  difference. Positive improvement means movement in the expected direction;
+  inspect the final offset too, because a move can cross past the target.
+
+The reported step count includes corrections after the previous PT detection;
+it counts commanded transport steps, not independently measured film travel.
+Positive Extra Steps are not included in that firmware counter. The threshold
+is labelled `last_reported_threshold` because the existing stop message includes
+only steps and PT, not its simultaneous threshold. A PT value outside 0–1023 is
+retained as raw diagnostic data with `pt_valid=False`.
+
+Logging uses existing messages and request metadata. It adds no exposures or
+controller polling. The Pi log timestamp marks receipt/processing; the camera
+sensor timestamp uses its boot-time clock. These records help locate the error
+in the sequence, but do not by themselves prove physical slip versus a changing
+image measurement.
+
 Run `python -m unittest discover -s tests -v`. Tests cover unknown detections,
 DNG reporting, ordered feedback, request ownership, stale exposures, unchanged
 counters on rejection, correction bounds, overshoot, missing/stale acknowledgements,

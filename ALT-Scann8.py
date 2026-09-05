@@ -2740,6 +2740,8 @@ def receive_alignment_response(payload, moved):
         set_alignment_status('Ready: automatic correction available' if alignment_firmware_supported
                              else 'Correction unavailable; pause protection active')
     elif alignment_move_pending is not None and payload == alignment_move_pending[0]:
+        logging.info('Alignment nudge ack frame=%i token=%i requested_steps=%i reported_steps=%i',
+                     CurrentFrame + 1, payload >> 8, payload & 255, moved)
         alignment_move_result = moved
     else:
         logging.warning('Ignoring stale alignment acknowledgement %i', payload)
@@ -2753,8 +2755,12 @@ def send_alignment_nudge(steps):
     payload = alignment_move_token * 256 + steps
     alignment_move_result = None
     alignment_move_pending = (payload, time.monotonic() + 3)
+    logging.info('Alignment nudge send frame=%i token=%i steps=%i',
+                 CurrentFrame + 1, alignment_move_token, steps)
     set_alignment_status(f'Correcting frame {CurrentFrame + 1}: {steps} steps')
     if not send_arduino_command(CMD_ALIGN_FRAME, payload):
+        logging.warning('Alignment nudge send failed frame=%i token=%i steps=%i',
+                        CurrentFrame + 1, alignment_move_token, steps)
         alignment_move_pending = None
         return False
     return True
@@ -2782,6 +2788,8 @@ def prepare_alignment_frame():
         payload, deadline = alignment_move_pending
         if alignment_move_result is None:
             if time.monotonic() > deadline:
+                logging.warning('Alignment nudge timeout frame=%i token=%i requested_steps=%i',
+                                CurrentFrame + 1, payload >> 8, payload & 255)
                 alignment_move_pending = None
                 pause_alignment_frame('Timed out waiting for corrective movement; command will not be repeated')
             return False
@@ -2814,6 +2822,8 @@ def prepare_alignment_frame():
             shift = FrameVCenterImageShift * height / PreviewHeight if PreviewHeight > 0 else FrameVCenterImageShift
             measurement = measure_hole(image, FilmType, shift)
             if measurement.offset is None and AlignmentGuardMode != 'Off':
+                logging.info('Alignment fallback frame=%i source=%s reason=%s',
+                             CurrentFrame + 1, measurement.source, measurement.reason)
                 # PIL normalizes the camera stream format to RGB. Inference
                 # runs on an owned copy while Tk keeps responding to Stop.
                 rgb = np.asarray(request.make_image('main').convert('RGB'))
@@ -2825,6 +2835,25 @@ def prepare_alignment_frame():
                 request = None
                 set_alignment_status(f'Checking damaged sprocket on frame {CurrentFrame + 1}')
                 return False
+        stage = ('after_nudge' if alignment_guard.attempts else
+                 'confirmation' if alignment_guard.confirming else 'initial')
+        metadata = request.get_metadata()  # Metadata of this request; no extra exposure.
+        logging.info('Alignment measurement frame=%i stage=%s nudge=%i offset_px=%s '
+                     'offset_pct=%s height_px=%i source=%s sensor_timestamp_ns=%s '
+                     'exposure_us=%s reason=%s',
+                     CurrentFrame + 1, stage, alignment_guard.attempts, measurement.offset,
+                     None if measurement.offset is None else round(100 * measurement.offset / height, 3),
+                     height, measurement.source, metadata.get('SensorTimestamp'),
+                     metadata.get('ExposureTime'), measurement.reason)
+        if alignment_guard.attempts:
+            # Log before inspect() can replace last_offset/next_steps with the
+            # starting point and size of another corrective move.
+            logging.info('Alignment nudge result frame=%i nudge=%i requested_steps=%i '
+                         'before_px=%s after_px=%s improvement_px=%s',
+                         CurrentFrame + 1, alignment_guard.attempts, alignment_guard.next_steps,
+                         alignment_guard.last_offset, measurement.offset,
+                         None if measurement.offset is None or alignment_guard.last_offset is None
+                         else alignment_guard.last_offset - measurement.offset)
         first_measurement = not alignment_guard.confirming
         if first_measurement and measurement.offset is not None and AutoFineTuneEnabled and measurement.source != 'yolo':
             offset_image.add_value(measurement.offset * int(CaptureResolution.split('x')[1]) / height)
@@ -2855,6 +2884,9 @@ def prepare_alignment_frame():
             set_alignment_status('Confirming alignment')
             return False
         if decision == 'nudge':
+            logging.info('Alignment nudge planned frame=%i nudge=%i steps=%i before_px=%s height_px=%i',
+                         CurrentFrame + 1, alignment_guard.attempts, alignment_guard.next_steps,
+                         measurement.offset, height)
             request.release()
             request = None
             if not send_alignment_nudge(alignment_guard.next_steps):
@@ -3905,6 +3937,18 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
         if Controller_Id == 1:
             send_arduino_command(CMD_ALIGN_FRAME, 0)
     elif ArduinoTrigger == RSP_FRAME_AVAILABLE:  # New Frame available
+        # The controller sends its actual detection-interval step count and
+        # raw PT reading. The threshold below is the latest reported value,
+        # not a simultaneous threshold sample from this event.
+        logging.info('Alignment stop frame=%i controller=%s reported_steps=%i pt_raw=%i '
+                     'pt_valid=%s last_reported_threshold=%s steps_setting=%s '
+                     'steps_auto=%s pt_auto=%s fine_tune=%s fine_auto=%s '
+                     'extra_steps=%s speed=%s settle_ms=%s guard=%s tolerance_pct=%s',
+                     CurrentFrame + 1, Controller_Id, ArduinoParam1, ArduinoParam2,
+                     0 <= ArduinoParam2 <= 1023, PtLevelValue, StepsPerFrame,
+                     AutoFrameStepsEnabled, AutoPtLevelEnabled, FrameFineTuneValue,
+                     AutoFineTuneEnabled, FrameExtraStepsValue, ScanSpeedValue,
+                     StabilizationDelayValue, AlignmentGuardMode, AlignmentGuardTolerance)
         # Delay shared with arduino, 2 seconds less to avoid conflict with end reel
         last_frame_time = time.time() + max_inactivity_delay - 2
         NewFrameAvailable = True

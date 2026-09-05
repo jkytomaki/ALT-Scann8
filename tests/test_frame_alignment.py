@@ -411,6 +411,7 @@ class MovementProtocolTests(unittest.TestCase):
 
     def test_stale_ack_cannot_complete_a_different_move(self):
         ns = scanner_functions('receive_alignment_response', Controller_Id=1,
+            CurrentFrame=42,
             alignment_move_pending=(532, time.monotonic() + 3), alignment_move_result=None,
             alignment_firmware_supported=True, set_alignment_status=Mock())
         ns['receive_alignment_response'](276, 20)
