@@ -112,12 +112,6 @@ from dynamic_spinbox import DynamicSpinbox
 from tooltip import Tooltips
 from rolling_average import RollingAverage
 
-try:
-    import rawpy
-    can_check_dng_frames_for_misalignment = True
-except ImportError:
-    can_check_dng_frames_for_misalignment = False
-
 #  ######### Global variable definition ##########
 win = None
 as_tooltips = None
@@ -868,13 +862,13 @@ def cmd_detect_misaligned_frames():
     global DetectMisalignedFrames, misaligned_tolerance_label
     DetectMisalignedFrames = detect_misaligned_frames.get()
     ConfigData["DetectMisalignedFrames"] = DetectMisalignedFrames
-    if ExpertMode: scan_error_counter_value_label.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+    if ExpertMode: scan_error_counter_value_label.config(state = NORMAL if DetectMisalignedFrames else DISABLED)
 
 
 def cmd_select_file_type(selected):
     global FileType
-    if ExpertMode: misaligned_tolerance_label.config(state = NORMAL if detect_misaligned_frames.get() and (file_type_dropdown_selected.get() != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
-    misaligned_tolerance_spinbox.config(state = NORMAL if detect_misaligned_frames.get() and (file_type_dropdown_selected.get() != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+    if ExpertMode: misaligned_tolerance_label.config(state = NORMAL if detect_misaligned_frames.get() else DISABLED)
+    misaligned_tolerance_spinbox.config(state = NORMAL if detect_misaligned_frames.get() else DISABLED)
 
 
 
@@ -924,7 +918,7 @@ def cmd_settings_popup_accept():
             AutoWbEnabled = ConfigData['AutoWbEnabled']
             AutoFrameStepsEnabled = ConfigData['AutoFrameStepsEnabled']  # FrameStepsAuto
             AutoPtLevelEnabled = ConfigData['AutoPtLevelEnabled']  # PTLevelAuto
-            FrameFineTuneValue = ConfigData["FrameFineTune"]
+            FrameFineTuneValue = max(5, min(95, ConfigData["FrameFineTune"]))
             ScanSpeedValue = ConfigData["ScanSpeed"]
             AutoFineTuneEnabled = ConfigData["AutoFineTuneEnabled"]
         if not SimulatedRun and not CameraDisabled:
@@ -1011,8 +1005,8 @@ def cmd_settings_popup_accept():
     capture_info_str.set(f"{FileType} - {CaptureResolution}")
 
     if not SimplifiedMode:
-        if ExpertMode: detect_misaligned_frames_btn.config(state = NORMAL if (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
-        if ExpertMode: scan_error_counter_value_label.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+        if ExpertMode: detect_misaligned_frames_btn.config(state=NORMAL)
+        if ExpertMode: scan_error_counter_value_label.config(state = NORMAL if DetectMisalignedFrames else DISABLED)
 
     if DisableToolTips:
         as_tooltips.disable()
@@ -1201,8 +1195,8 @@ def cmd_settings_popup():
     options_ok_btn.grid(row=options_row, column=1, padx=10, pady=5, sticky='E')
 
     # arrange status for multidependent widgets. Initially enabled, increase counter for each disable condition   
-    if ExpertMode: misaligned_tolerance_label.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
-    misaligned_tolerance_spinbox.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+    if ExpertMode: misaligned_tolerance_label.config(state = NORMAL if DetectMisalignedFrames else DISABLED)
+    misaligned_tolerance_spinbox.config(state = NORMAL if DetectMisalignedFrames else DISABLED)
 
     options_dlg.protocol("WM_DELETE_WINDOW", cmd_settings_popup_dismiss)  # intercept close button
     options_dlg.transient(win)  # dialog window is related to main
@@ -1765,7 +1759,7 @@ def adjust_auto_fine_tune():
     global FrameFineTuneValue, PreviousFrameFineTuneValue, auto_fine_tune_wait, auto_fine_tune_limit_warned
     offset_avg = offset_image.get_average()
     if offset_avg == None:
-        return  # Too early as to rely on average (less than 50 samples)
+        return  # No valid hole measurements yet
     else:
         offset_avg = int(offset_avg)
     if auto_fine_tune_wait > 0:
@@ -1776,21 +1770,18 @@ def adjust_auto_fine_tune():
     direction = 1 if offset_avg > 0 else -1
     step = min(10, max(1, int(abs(offset_avg)/10))) # big steps for big offsets, at least 1 once past the dead band
     FrameFineTuneValue += int(direction * step)
-    if FrameFineTuneValue < 0:
-        FrameFineTuneValue = 0
-    elif FrameFineTuneValue > 100:
-        FrameFineTuneValue = 100
+    FrameFineTuneValue = max(5, min(95, FrameFineTuneValue))
     if PreviousFrameFineTuneValue != FrameFineTuneValue:
         PreviousFrameFineTuneValue = FrameFineTuneValue
         auto_fine_tune_limit_warned = False
         logging.debug(f"Average offset is {offset_avg}, adjusting fine tune value by {direction * step} to {FrameFineTuneValue}")
         send_arduino_command(CMD_SET_FRAME_FINE_TUNE, FrameFineTuneValue)
         frame_fine_tune_value.set(FrameFineTuneValue)
-    elif step > 0 and FrameFineTuneValue in (0, 100) and not auto_fine_tune_limit_warned:
+    elif step > 0 and FrameFineTuneValue in (5, 95) and not auto_fine_tune_limit_warned:
         auto_fine_tune_limit_warned = True
         logging.warning(f"Auto fine tune stuck at limit ({FrameFineTuneValue}) with average offset {offset_avg}: "
                         "cannot correct further, adjust steps per frame, extra steps or PT level")
-    auto_fine_tune_wait = 2    # wait 5 frames to see the effect of this change
+    auto_fine_tune_wait = 2    # Wait two measured frames before adjusting again
 
 
 def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice_width=10):
@@ -1869,7 +1860,7 @@ def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice
             return True, (result - middle) if result > middle else -(middle - result)
         else:
             return False, (result - middle) if result > middle else -(middle - result)
-    return False, -1
+    return False, None
 
 
 def reverse_image(image):
@@ -1945,20 +1936,21 @@ def capture_save_thread(queue, event, id):
                 request.save_dng(HdrFrameFilenamePattern % (frame_idx, hdr_idx, FileType))
             else:  # Non HDR
                 request.save_dng(FrameFilenamePattern % (frame_idx, FileType))                    
-                if DetectMisalignedFrames and can_check_dng_frames_for_misalignment:
+                if (DetectMisalignedFrames or AutoFineTuneEnabled):
                     captured_image = request.make_array('main')
             request.release()   # Release request ASAP (delay frame alignment check)
-            if DetectMisalignedFrames and can_check_dng_frames_for_misalignment and hdr_idx <= 1:
+            if (DetectMisalignedFrames or AutoFineTuneEnabled) and hdr_idx <= 1:
                 frame_centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
-                offset_image.add_value(offset)
-                if AutoFineTuneEnabled:
-                    adjust_auto_fine_tune()
-                if not frame_centered:
+                if offset is not None:
+                    offset_image.add_value(offset)
+                    if AutoFineTuneEnabled:
+                        adjust_auto_fine_tune()
+                if DetectMisalignedFrames and not frame_centered:
                     scan_error_counter += 1
                     if scan_error_total_frames_counter > 0:
                         scan_error_counter_value.set(f"{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)")
                     with open(scan_error_log_fullpath, 'a') as f:
-                        f.write(f"Misaligned frame, {CurrentFrame}\n")
+                        f.write(f"Misaligned frame, {frame_idx}\n")
             logging.debug("Thread %i saved request DNG image: %s ms", id,
                           str(round((time.time() - curtime) * 1000, 1)))
         else:
@@ -1971,7 +1963,7 @@ def capture_save_thread(queue, event, id):
                                  HdrFrameFilenamePattern % (frame_idx, hdr_idx, FileType))
                 else:  # Non HDR
                     request.save('main', FrameFilenamePattern % (frame_idx, FileType))
-                    if DetectMisalignedFrames:
+                    if DetectMisalignedFrames or AutoFineTuneEnabled:
                         captured_image = request.make_array('main')
                 request.release()
                 logging.debug("Thread %i saved request image: %s ms", id,
@@ -1992,11 +1984,12 @@ def capture_save_thread(queue, event, id):
             # misalignment detection asked for the array (REQUEST_TOKEN path). Guard the
             # check so PNG or HDR sub-frame scans with detection off do not dereference an
             # unbound captured_image here. Alignment only applies to the base frame (hdr_idx <= 1).
-            if hdr_idx <= 1 and (type == IMAGE_TOKEN or DetectMisalignedFrames):
+            if hdr_idx <= 1 and (DetectMisalignedFrames or AutoFineTuneEnabled):
                 frame_centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
-                offset_image.add_value(offset)
-                if AutoFineTuneEnabled:
-                    adjust_auto_fine_tune()
+                if offset is not None:
+                    offset_image.add_value(offset)
+                    if AutoFineTuneEnabled:
+                        adjust_auto_fine_tune()
                 if DetectMisalignedFrames and not frame_centered:
                     scan_error_counter += 1
                     if scan_error_total_frames_counter > 0:
@@ -3182,6 +3175,11 @@ def capture_loop():
             image_np = np.array(sample_image)  # PIL gives RGB by default
             image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR
             centered, offset = is_frame_centered(image_bgr, FilmType, threshold=MisalignedFrameTolerance)
+            if offset is None:
+                logging.warning("VFD: no sprocket detected; stopping before advancing")
+                ScanStopRequested = True
+                win.after(5, capture_loop)
+                return
             img_height = sample_image.size[1]
             pixels_per_step = img_height // (FrameStepsS8 if FilmType == 'S8' else FrameStepsR8)   # Height divided by number of steps = pixels per step
             vfd_CurrentFrame_previous = CurrentFrame
@@ -4169,7 +4167,7 @@ def load_session_data_post_init():
                 if 'MinFrameStepsR8' in ConfigData:
                     MinFrameStepsR8 = ConfigData["MinFrameStepsR8"]
                 if 'FrameFineTune' in ConfigData:
-                    FrameFineTuneValue = ConfigData["FrameFineTune"]
+                    FrameFineTuneValue = max(5, min(95, ConfigData["FrameFineTune"]))
                     frame_fine_tune_value.set(FrameFineTuneValue)
                     send_arduino_command(CMD_SET_FRAME_FINE_TUNE, FrameFineTuneValue)
                 if 'FrameExtraSteps' in ConfigData:
@@ -4604,9 +4602,6 @@ def tscann8_init():
     else:
         logging.info("Running on Raspberry Pi")
 
-    if not can_check_dng_frames_for_misalignment:
-        logging.warning("Frame alignment for DNG files is disabled. To enable it please install rawpy library")
-
     logging.debug("BaseFolder=%s", BaseFolder)
 
     if not SimulatedRun:
@@ -4977,6 +4972,13 @@ def cmd_set_frame_vcenter():
         # Convert RGB to BGR
         bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
         _, FrameVCenterHoleShift = is_frame_centered(bgr_image, FilmType, compensate=False)
+        if FrameVCenterHoleShift is None:
+            FrameVCenterEnabled = False
+            frame_vcenter_enabled.set(False)
+            except_widget_global_enable([frame_vcenter_btn, frame_vcenter_spinbox], True)
+            widget_list_enable([id_FrameVCenterEnabled])
+            tk.messagebox.showwarning("Sprocket not found", "Cannot calibrate vertical centering without a visible sprocket hole.")
+            return
         # Temporary diagnostics: dump the exact analyzed image and result for column_probe.py
         cv2.imwrite('/tmp/vcenter_input.png', bgr_image)
         logging.warning(f"VCenter probe: analyzed image {bgr_image.shape[1]}x{bgr_image.shape[0]}, "
