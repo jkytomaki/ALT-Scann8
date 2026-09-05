@@ -205,6 +205,30 @@ class GuardTests(unittest.TestCase):
         img[600:800, 40:70] = 255
         self.assertAlmostEqual(measure_hole(img, 'S8').offset, 199.5)
 
+    def test_two_agreeing_strips_survive_a_mark_inside_the_third(self):
+        # Frame 146: a mark splits one strip into a false short hole and a
+        # fragment below the minimum height. The two intact strips must win.
+        for x in (30, 40, 50):
+            img = np.zeros((1000, 1000, 3), np.uint8)
+            img[375:625, 20:70] = 255
+            img[550:552, x:x + 3] = 0
+            for film_type, image in [('S8', img), ('R8', 255 - img)]:
+                with self.subTest(x=x, film_type=film_type):
+                    self.assertAlmostEqual(measure_hole(image, film_type).offset, -0.5)
+
+    def test_overlapping_pairs_do_not_choose_an_arbitrary_position(self):
+        img = np.zeros((1000, 1000, 3), np.uint8)
+        for x, center in zip((30, 40, 50), (490, 500, 510)):
+            img[center - 100:center + 100, x:x + 3] = 255
+        # Both adjacent pairs agree, but all three span more than 1.5%.
+        self.assertIsNone(measure_hole(img, 'S8').offset)
+
+    def test_three_disagreeing_strips_remain_unknown(self):
+        img = np.zeros((1000, 1000, 3), np.uint8)
+        for x, center in zip((30, 40, 50), (400, 500, 600)):
+            img[center - 100:center + 100, x:x + 3] = 255
+        self.assertIsNone(measure_hole(img, 'S8').offset)
+
     def test_scan_does_not_count_save_or_advance_rejected_frame(self):
         ns = scanner_functions('capture_loop', ScanStopRequested=False, ScanOngoing=True,
             alignment_paused=False, FrameDetectMode='PFD', NewFrameAvailable=True, RetryingFrame=False,

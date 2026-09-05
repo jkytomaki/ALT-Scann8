@@ -23,8 +23,9 @@ Guard tolerance defaults to **3% of image height**, independently of the existin
 8% bad-frame reporting tolerance. Set Frame VCenter for the film before scanning.
 This verifies sprocket position relative to that calibrated target, not the actual
 picture borders: stock with a different picture-to-hole relationship can require
-recalibration. The three detection strips must agree on a complete hole (S8) or
-gap (R8). Clipped or ambiguous detections pause instead of driving the motor.
+recalibration. At least two of three detection strips must agree on a complete
+hole (S8) or gap (R8). One outlying strip is ignored only when the agreeing pair
+is unique. Clipped or ambiguous detections pause instead of driving the motor.
 
 A pause dialog offers **Retry this frame**, **Save this frame and stop**, and
 **Stop without saving**. Retry rechecks the held physical frame without incrementing
@@ -37,6 +38,28 @@ film frame. Guard events include its intended filename in the scan error log.
 Normal DNG/PNG captures reuse the checked camera request. JPEG uses its RGB image.
 HDR and captures requesting exposure adaptation verify position first, then take
 their required exposures while the film stays stationary.
+
+### Live scan observations, 2026-09-05
+
+On `ven-1f3`, frame 146 was rejected twice despite a nearly centered sprocket.
+Reprocessing its saved DNG at full resolution reproduced the rejection: strip
+centers were 1486.0, 1485.5 and 1378.5 pixels. A dark mark interrupted the third
+strip. The unique agreeing-pair fix returns -34.25 pixels (-1.13%) instead of
+unknown. These are measurements of the saved DNG render, not the discarded
+preflight exposures.
+
+The live log confirms forward corrections on frames 456, 457 and 460: 19, 21 and
+18 steps respectively, with residuals 81.5, 95.0 and 64.0 pixels. Fine Tune then
+reported its upper limit of 95 with an average offset of 81 pixels. Overshoot
+pauses occurred at frame 63 (-6.2%), 389 (-7.5%) and 531 (-8.0%). Increasing guard
+tolerance admits these offsets; it does not stabilize the transport.
+
+The cause of that remaining position variation is not established. Candidate
+contributors include the interaction of the dynamic PT threshold, learned
+minimum-step gate, and delayed camera Fine Tune feedback (five-frame average,
+up to ten ratio points per adjustment, two measured frames between adjustments),
+along with transport tension/slip. A controlled comparison with fixed Fine Tune
+and per-frame offset/threshold/step telemetry is needed to distinguish them.
 
 ## Nano firmware
 

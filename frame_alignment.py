@@ -38,7 +38,15 @@ def measure_hole(image, film_type, target_shift=0):
             continue
         start, end = areas[0]
         centers.append((start + end - 1) / 2)
-    if len(centers) < 2 or max(centers) - min(centers) > height * 0.015:
+    centers.sort()
+    agreement = height * 0.015
+    if len(centers) >= 2 and centers[-1] - centers[0] > agreement:
+        # A damaged edge can produce one wrong center. Require a unique pair
+        # of agreeing strips; overlapping pairs with different centers remain
+        # ambiguous rather than choosing whichever pair happens to come first.
+        pairs = [(a, b) for a, b in zip(centers, centers[1:]) if b - a <= agreement]
+        centers = list(pairs[0]) if len(pairs) == 1 else []
+    if len(centers) < 2:
         return HoleMeasurement(None, height, 'No unambiguous complete sprocket detected')
     return HoleMeasurement(float(np.median(centers)) - height / 2 - target_shift, height)
 
