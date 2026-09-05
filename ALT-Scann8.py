@@ -6678,6 +6678,7 @@ def create_widgets():
             row=frame_align_row, column=0, sticky=W)
         alignment_guard_mode_var = tk.StringVar(value=AlignmentGuardMode)
         guard_menu = tk.OptionMenu(frame_alignment_frame, alignment_guard_mode_var, 'Off', 'Pause', 'Correct', command=cmd_alignment_guard)
+        guard_menu.configure(font=("Arial", FontSize - 2), padx=3, pady=0, borderwidth=1)
         guard_menu.widget_type = 'control'
         guard_menu.grid(row=frame_align_row, column=1, columnspan=2, sticky=E)
         as_tooltips.add(guard_menu, "Check framing before saving or advancing. Correct uses bounded forward nudges on supported Nano firmware (S8); otherwise it pauses. Off disables protection.")
@@ -6691,9 +6692,9 @@ def create_widgets():
         guard_tolerance.bind('<FocusOut>', cmd_alignment_guard)
         guard_tolerance.grid(row=frame_align_row, column=1, columnspan=2, sticky=E)
         frame_align_row += 1
-        alignment_status_var = tk.StringVar(value='Ready' if alignment_firmware_supported else 'Correction unavailable; pause protection active')
-        tk.Label(frame_alignment_frame, textvariable=alignment_status_var, font=("Arial", FontSize - 2),
-            wraplength=240).grid(row=frame_align_row, column=0, columnspan=3, sticky=W)
+        alignment_status_var = tk.StringVar(value='Ready' if alignment_firmware_supported else 'Pause only; Nano update needed')
+        tk.Label(frame_alignment_frame, textvariable=alignment_status_var, font=("Arial", FontSize - 3),
+            width=30, height=1, anchor=W).grid(row=frame_align_row, column=0, columnspan=3, sticky=W)
         frame_align_row += 1
 
         # Scan error counter
