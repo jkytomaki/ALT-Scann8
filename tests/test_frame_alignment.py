@@ -1,5 +1,6 @@
 """Exercise scanner functions without importing camera hardware or starting Tk."""
 import ast
+from datetime import datetime
 import logging
 from pathlib import Path
 import queue
@@ -26,6 +27,56 @@ def scanner_functions(*names, **state):
     ns.update(state)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), 'exec'), ns)
     return ns
+
+
+class HeldFrameSaveTests(unittest.TestCase):
+    def state(self):
+        ns = scanner_functions('save_alignment_frame_and_stop',
+            ScanOngoing=True, alignment_paused=True, CurrentFrame=2, CurrentStill=1,
+            session_frames=2, FramesToGo=8, NewFrameAvailable=True, RetryingFrame=False,
+            ScanStopRequested=False, capture=Mock(), register_frame=Mock(),
+            frames_to_go_str=Mock(get=Mock(return_value='8')), ConfigData={},
+            datetime=datetime, CurrentDir='/scans', FilmType='S8',
+            Scanned_Images_number=Mock(), scanned_Images_time_value=Mock(),
+            stop_scan=Mock(), set_alignment_status=Mock(), tk=Mock(),
+            send_arduino_command=Mock())
+        return ns
+
+    def test_saves_next_number_and_stops_after_capture_without_moving(self):
+        ns = self.state()
+        events = []
+        ns['capture'].side_effect = lambda mode: events.append((mode, ns['CurrentFrame']))
+        def stop():
+            events.append('stop')
+            ns['ScanOngoing'] = False
+        ns['stop_scan'].side_effect = stop
+        ns['save_alignment_frame_and_stop']()
+        ns['save_alignment_frame_and_stop']()  # Double click cannot save twice.
+        self.assertEqual(events, [('normal', 3), 'stop'])
+        self.assertEqual(ns['ConfigData']['CurrentFrame'], '3')
+        self.assertEqual(ns['session_frames'], 3)
+        self.assertEqual(ns['FramesToGo'], 7)
+        self.assertFalse(ns['NewFrameAvailable'])
+        ns['Scanned_Images_number'].set.assert_called_once_with(3)
+        ns['send_arduino_command'].assert_not_called()
+
+    def test_capture_failure_keeps_same_frame_paused(self):
+        ns = self.state()
+        ns['capture'].side_effect = RuntimeError('camera failed')
+        ns['save_alignment_frame_and_stop']()
+        self.assertEqual(ns['CurrentFrame'], 2)
+        self.assertEqual(ns['session_frames'], 2)
+        self.assertTrue(ns['alignment_paused'])
+        ns['stop_scan'].assert_not_called()
+        ns['send_arduino_command'].assert_not_called()
+        ns['tk'].messagebox.showerror.assert_called_once()
+
+    def test_stale_dialog_action_does_nothing(self):
+        ns = self.state()
+        ns['alignment_paused'] = False
+        ns['save_alignment_frame_and_stop']()
+        ns['capture'].assert_not_called()
+        self.assertEqual(ns['CurrentFrame'], 2)
 
 
 class DetectionTests(unittest.TestCase):

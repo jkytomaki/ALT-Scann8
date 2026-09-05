@@ -26,11 +26,13 @@ picture borders: stock with a different picture-to-hole relationship can require
 recalibration. The three detection strips must agree on a complete hole (S8) or
 gap (R8). Clipped or ambiguous detections pause instead of driving the motor.
 
-A pause dialog offers **Retry this frame** and **Stop scan**. Retry rechecks the
-held physical frame without incrementing counters. Stop ends the session while
-leaving the frame unsaved: retain it manually before starting a new scan, since
-a normal scan start requests a new film frame. Guard events include its intended
-filename in the scan error log.
+A pause dialog offers **Retry this frame**, **Save this frame and stop**, and
+**Stop without saving**. Retry rechecks the held physical frame without incrementing
+counters. Save explicitly accepts its position, uses the normal scan format and
+next frame number (including HDR when enabled), updates counters, and stops without
+advancing. Normal save workers finish writing queued exposures after stopping.
+Stop without saving leaves this frame unsaved; a normal scan start requests a new
+film frame. Guard events include its intended filename in the scan error log.
 
 Normal DNG/PNG captures reuse the checked camera request. JPEG uses its RGB image.
 HDR and captures requesting exposure adaptation verify position first, then take

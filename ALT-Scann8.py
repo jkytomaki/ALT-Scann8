@@ -2628,6 +2628,49 @@ def stop_alignment_scan():
     set_alignment_status(f'Stopped before frame {CurrentFrame + 1}; frame remains unsaved')
 
 
+def save_alignment_frame_and_stop():
+    """Accept the held position explicitly, capture normally, and never advance."""
+    global CurrentFrame, CurrentStill, session_frames, FramesToGo
+    global NewFrameAvailable, RetryingFrame, ScanStopRequested
+    if not ScanOngoing or not alignment_paused:
+        return
+    previous_frame = CurrentFrame
+    CurrentFrame += 1
+    CurrentStill = 1
+    try:
+        # Keep the scan paused (and UV on) until all required exposures are taken.
+        # The regular save workers retain ownership of queued camera requests.
+        capture('normal')
+    except Exception as error:
+        CurrentFrame = previous_frame
+        ConfigData['CurrentFrame'] = str(CurrentFrame)
+        logging.exception('Failed to capture held frame %s', CurrentFrame + 1)
+        set_alignment_status(f'Capture failed; film still held: {error}')
+        tk.messagebox.showerror('Capture failed',
+                                'The film is still held. Check the output files before retrying.\n'
+                                + str(error))
+        return
+    session_frames += 1
+    register_frame()
+    remaining = frames_to_go_str.get()
+    if remaining.isdigit() and int(remaining) > 0:
+        FramesToGo = int(remaining) - 1
+        frames_to_go_str.set(str(FramesToGo))
+        ConfigData['FramesToGo'] = FramesToGo
+    ConfigData['CurrentDate'] = str(datetime.now())
+    ConfigData['CurrentDir'] = CurrentDir
+    ConfigData['CurrentFrame'] = str(CurrentFrame)
+    Scanned_Images_number.set(CurrentFrame)
+    fps = 18 if FilmType == 'S8' else 16
+    scanned_Images_time_value.set(f'{(CurrentFrame // fps) // 60:02}:{(CurrentFrame // fps) % 60:02}')
+    NewFrameAvailable = False
+    RetryingFrame = False
+    ScanStopRequested = False
+    logging.info('Accepted held frame %s manually; stopping without advancing', CurrentFrame)
+    stop_scan()
+    set_alignment_status(f'Frame {CurrentFrame} captured for normal saving; stopped without advancing')
+
+
 def pause_alignment_frame(reason, image=None):
     global alignment_paused, alignment_pause_dialog
     release_alignment_request()
@@ -2644,10 +2687,11 @@ def pause_alignment_frame(reason, image=None):
     alignment_pause_dialog.transient(win)
     tk.Label(alignment_pause_dialog, text=(
         f'{filename} has not been saved. The film is held at this frame.\n\n{reason}\n\n'
-        'Retry checks the same frame. Stop ends the scan; capture this frame\n'
-        'manually before starting a new scan if you need to retain it.'), padx=16, pady=16).pack()
+        'Retry checks the same frame. Save uses the normal scan filename\n'
+        'and stops without advancing. Stop without saving leaves this frame unsaved.'), padx=16, pady=16).pack()
     tk.Button(alignment_pause_dialog, text='Retry this frame', command=retry_alignment_frame).pack(side=LEFT, padx=16, pady=12)
-    tk.Button(alignment_pause_dialog, text='Stop scan', command=stop_alignment_scan).pack(side=RIGHT, padx=16, pady=12)
+    tk.Button(alignment_pause_dialog, text='Save this frame and stop', command=save_alignment_frame_and_stop).pack(side=LEFT, padx=8, pady=12)
+    tk.Button(alignment_pause_dialog, text='Stop without saving', command=stop_alignment_scan).pack(side=RIGHT, padx=16, pady=12)
     alignment_pause_dialog.protocol('WM_DELETE_WINDOW', stop_alignment_scan)
 
 
