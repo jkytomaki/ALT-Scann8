@@ -2652,6 +2652,7 @@ def save_alignment_frame(continue_scan=False):
     """Accept this position once, using the normal filename and capture path."""
     global CurrentFrame, CurrentStill, session_frames, FramesToGo
     global NewFrameAvailable, RetryingFrame, ScanStopRequested
+    global last_frame_time
     if not ScanOngoing or not alignment_paused:
         return
     previous_frame = CurrentFrame
@@ -2689,6 +2690,9 @@ def save_alignment_frame(continue_scan=False):
     counter_finished = (remaining.isdigit() and int(remaining) <= 1
                         and AutoStopEnabled and autostop_type.get() == 'counter_to_zero')
     if continue_scan and not counter_finished and not ScanStopRequested:
+        # A manual pause can outlast the watchdog. Give the next advance a
+        # fresh interval before exposing an unpaused, guard-free scan state.
+        last_frame_time = time.time() + max_inactivity_delay - 2
         reset_alignment_guard()
         # The regular I2C retry path advances an already captured frame without
         # saving/counting it again, including when the first send fails.

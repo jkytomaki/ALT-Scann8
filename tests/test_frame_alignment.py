@@ -42,7 +42,8 @@ class HeldFrameSaveTests(unittest.TestCase):
             Scanned_Images_number=Mock(), scanned_Images_time_value=Mock(),
             stop_scan=Mock(), set_alignment_status=Mock(), tk=Mock(),
             send_arduino_command=Mock(), AutoStopEnabled=False, autostop_type=Mock(),
-            reset_alignment_guard=Mock(), win=Mock(), capture_loop=Mock())
+            reset_alignment_guard=Mock(), win=Mock(), capture_loop=Mock(),
+            last_frame_time=0, max_inactivity_delay=12)
         return ns
 
     def test_saves_next_number_and_stops_after_capture_without_moving(self):

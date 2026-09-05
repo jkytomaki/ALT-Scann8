@@ -1,6 +1,7 @@
 """Transport safety and geometry checks independent of optional NCNN."""
 from concurrent.futures import Future
 import threading
+import time
 import unittest
 from unittest.mock import Mock
 
@@ -139,6 +140,14 @@ class AsyncTests(unittest.TestCase):
 
 
 class ContinueTests(unittest.TestCase):
+    def test_continue_resets_expired_watchdog_before_unpausing(self):
+        ns = base.HeldFrameSaveTests().state()
+        deadlines = []
+        ns['reset_alignment_guard'].side_effect = lambda: deadlines.append(ns['last_frame_time'])
+        before = time.time()
+        ns['save_alignment_frame_and_continue']()
+        self.assertGreaterEqual(deadlines[0], before + ns['max_inactivity_delay'] - 2)
+
     def test_capture_sees_correct_hdr_session_parity(self):
         ns = base.HeldFrameSaveTests().state()
         seen = []

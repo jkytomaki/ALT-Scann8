@@ -34,6 +34,8 @@ next frame number (including HDR when enabled), and updates counters once.
 Save and continue advances after capture; an I2C send failure retries only the
 advance, without saving or counting again. An armed frame-count stop still stops
 after the last requested frame. Save this frame and stop keeps the film held.
+Continuing also resets the controller watchdog interval, so time spent paused
+cannot immediately trigger a synthetic frame event after the next advance.
 Normal save workers finish writing queued exposures after stopping.
 Stop without saving leaves this frame unsaved; a normal scan start requests a new
 film frame. Guard events include its intended filename in the scan error log.
