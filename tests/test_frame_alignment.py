@@ -223,6 +223,14 @@ class PreflightTests(unittest.TestCase):
 
 
 class CorrectionTests(unittest.TestCase):
+    def test_configured_tolerance_still_applies_after_a_nudge(self):
+        for residual in (-60, 60):
+            with self.subTest(residual=residual):
+                guard = AlignmentGuard(3, correct=True, steps_per_frame=280)
+                guard.inspect(HoleMeasurement(500, 3040))
+                self.assertEqual(guard.inspect(HoleMeasurement(500, 3040)), 'nudge')
+                self.assertEqual(guard.inspect(HoleMeasurement(residual, 3040)), 'accept')
+
     def test_corrects_19_percent_shift_without_advancing_to_another_film_frame(self):
         guard = AlignmentGuard(3, correct=True, steps_per_frame=280)
         offset = 588.0
@@ -234,7 +242,7 @@ class CorrectionTests(unittest.TestCase):
             self.assertEqual(decision, 'nudge', guard.reason)
             self.assertLessEqual(guard.next_steps, 40)
             offset -= guard.next_steps * 8.8  # Measured pitch can be smaller than sensor height.
-        self.assertLessEqual(abs(offset), 3040 * 0.015)
+        self.assertLessEqual(abs(offset), 3040 * 0.03)
         self.assertLessEqual(guard.attempts, 4)
         self.assertLessEqual(guard.total_steps, 280 // 3)
 

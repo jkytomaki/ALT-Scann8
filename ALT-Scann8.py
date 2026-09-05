@@ -2638,7 +2638,7 @@ def pause_alignment_frame(reason, image=None):
         log.write(f'Alignment paused, {CurrentFrame + 1}, {filename}, {reason}\n')
     set_alignment_status(f'Paused before frame {CurrentFrame + 1}: {reason}')
     if image is not None:
-        draw_preview_image(Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB)), CurrentFrame + 1, 0)
+        draw_preview_image(image, CurrentFrame + 1, 0)
     alignment_pause_dialog = tk.Toplevel(win)
     alignment_pause_dialog.title('Alignment paused')
     alignment_pause_dialog.transient(win)
@@ -2755,9 +2755,11 @@ def prepare_alignment_frame():
                 pause_alignment_frame('Could not send corrective movement; command will not be repeated')
             return False
         reason = alignment_guard.reason or measurement.reason or f'Offset {100 * measurement.offset / height:+.1f}% exceeds {AlignmentGuardTolerance:g}%'
+        if measurement.offset is not None and alignment_guard.reason:
+            reason += f' (offset {100 * measurement.offset / height:+.1f}%, tolerance {AlignmentGuardTolerance:g}%)'
         if AlignmentGuardMode == 'Correct' and not alignment_firmware_supported:
             reason += '. Automatic correction requires the Nano alignment firmware update'
-        pause_alignment_frame(reason, image)
+        pause_alignment_frame(reason, request.make_image('main'))
         return False
     except (RuntimeError, KeyError, ValueError, cv2.error) as error:
         logging.exception('Cannot verify stationary frame')

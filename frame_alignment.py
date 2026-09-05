@@ -59,8 +59,8 @@ class AlignmentGuard:
 
     def inspect(self, measurement):
         offset, height = measurement.offset, measurement.height
-        # Once correcting, aim closer to the target than the initial trigger.
-        tolerance = height * self.tolerance_percent / (200 if self.attempts else 100)
+        # A nudge must not make an otherwise acceptable frame fail the guard.
+        tolerance = height * self.tolerance_percent / 100
         if offset is not None and abs(offset) <= tolerance:
             return 'accept'
         if not self.confirming:

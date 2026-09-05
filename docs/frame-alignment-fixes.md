@@ -51,8 +51,9 @@ The controller permits nudges only while holding a PT-detected frame, suspends
 collection during that hold, and includes corrective travel in the next frame's
 minimum-step calculation. Each frame is limited to one third of the minimum
 frame travel. Python additionally limits correction to four attempts, confirms
-improvement after each nudge, and waits for a fresh settled exposure. Once
-correction begins, it aims within half the guard tolerance.
+improvement after each nudge, and waits for a fresh settled exposure. The configured
+guard tolerance applies both before and after correction; a nudge does not tighten
+the acceptance limit.
 
 Build for this scanner's Nano old bootloader:
 
