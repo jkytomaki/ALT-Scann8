@@ -44,15 +44,51 @@ def measure_hole(image, film_type, target_shift=0):
 
 
 class AlignmentGuard:
-    """Confirm suspect measurements on the same film frame before pausing."""
-    def __init__(self, tolerance_percent=3):
+    """Bounded forward correction, confirmed by another stationary exposure."""
+    def __init__(self, tolerance_percent=3, correct=False, steps_per_frame=0):
         self.tolerance_percent = tolerance_percent
+        self.correct = correct
+        self.steps_per_frame = steps_per_frame
         self.confirming = False
+        self.confirm_offset = None
+        self.attempts = 0
+        self.total_steps = 0
+        self.next_steps = 0
+        self.last_offset = None
+        self.reason = ''
 
     def inspect(self, measurement):
-        if measurement.offset is not None and abs(measurement.offset) <= measurement.height * self.tolerance_percent / 100:
+        offset, height = measurement.offset, measurement.height
+        # Once correcting, aim closer to the target than the initial trigger.
+        tolerance = height * self.tolerance_percent / (200 if self.attempts else 100)
+        if offset is not None and abs(offset) <= tolerance:
             return 'accept'
         if not self.confirming:
             self.confirming = True
+            self.confirm_offset = offset
             return 'confirm'
-        return 'pause'
+        if offset is None:
+            self.reason = measurement.reason or 'Sprocket position is uncertain'
+            return 'pause'
+        if self.attempts == 0 and (self.confirm_offset is None or abs(offset - self.confirm_offset) > height * 0.015):
+            self.reason = 'Stationary exposures disagree on sprocket position'
+            return 'pause'
+        if not self.correct:
+            return 'pause'
+        if offset < 0:
+            self.reason = 'Frame has passed the target; automatic reversal is disabled'
+            return 'pause'
+        if self.last_offset is not None and offset >= self.last_offset - height * 0.002:
+            self.reason = 'Corrective movement did not improve alignment'
+            return 'pause'
+        remaining = int(self.steps_per_frame / 3) - self.total_steps
+        if self.attempts >= 4 or remaining <= 0 or self.steps_per_frame <= 0:
+            self.reason = 'Correction limit reached'
+            return 'pause'
+        # Sensor height may include more than one film pitch. Under-correct and
+        # re-measure rather than assuming an exact pixels-per-step calibration.
+        self.next_steps = min(40, remaining, max(1, int(offset / height * self.steps_per_frame * 0.75)))
+        self.last_offset = offset
+        self.attempts += 1
+        self.total_steps += self.next_steps
+        return 'nudge'

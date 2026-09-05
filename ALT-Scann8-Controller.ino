@@ -18,9 +18,9 @@ More info in README.md file
 #define __copyright__   "Copyright 2022-25, Juan Remirez de Esparza"
 #define __credits__     "Juan Remirez de Esparza"
 #define __license__     "MIT"
-#define __version__     "1.1.11"
-#define  __date__       "2025-06-08"
-#define  __version_highlight__  "Fallback to PT based film detection. Problem causing it to not work in VFD mode fixed."
+#define __version__     "1.1.12"
+#define  __date__       "2026-09-05"
+#define  __version_highlight__  "Bounded, acknowledged framing corrections while holding a PT-detected frame."
 #define __maintainer__  "Juan Remirez de Esparza"
 #define __email__       "jremirez@hotmail.com"
 #define __status__      "Development"
@@ -75,6 +75,7 @@ int UI_Command; // Stores I2C command from Raspberry PI --- ScanFilm=10 / Unlock
 #define CMD_ADVANCE_FRAME 41
 #define CMD_ADVANCE_FRAME_FRACTION 42
 #define CMD_RUN_FILM_COLLECTION 43
+#define CMD_ALIGN_FRAME 44
 #define CMD_SET_PT_LEVEL 50
 #define CMD_SET_MIN_FRAME_STEPS 52
 #define CMD_SET_FRAME_FINE_TUNE 54
@@ -104,6 +105,7 @@ int UI_Command; // Stores I2C command from Raspberry PI --- ScanFilm=10 / Unlock
 #define RSP_SCAN_ENDED 88
 #define RSP_FILM_FORWARD_ENDED 89
 #define RSP_ADVANCE_FRAME_FRACTION 90
+#define RSP_ALIGN_FRAME 91
 
 
 // Immutable values
@@ -421,6 +423,31 @@ void loop() {
                 SetReelsAsNeutral(HIGH, HIGH, HIGH);
                 ScanState = Sts_Idle;
                 break;
+            case CMD_ALIGN_FRAME:
+                // Zero probes support. High byte is a token (1..127); low byte
+                // is forward steps (1..40). Echo both, plus actual moved steps.
+                if (param == 0) {
+                    SendToRPi(RSP_ALIGN_FRAME, 0, 1);
+                }
+                else {
+                    int steps = param & 255;
+                    int token = (param >> 8) & 127;
+                    if (param > 0 && token > 0 && steps >= 1 && steps <= 40 &&
+                        ScanState == Sts_Idle && CaptureInProgress && scan_process_ongoing &&
+                        !VFD_mode_active && FrameStepsDone + steps <= MinFrameSteps / 3) {
+                        SetReelsAsNeutral(HIGH, LOW, LOW);
+                        digitalWrite(MotorB_Direction, HIGH);
+                        capstan_advance(steps);
+                        // Count this travel in the next PT detection interval;
+                        // otherwise its minimum-step gate could skip a hole.
+                        FrameStepsDone += steps;
+                        SendToRPi(RSP_ALIGN_FRAME, param, steps);
+                    }
+                    else {
+                        SendToRPi(RSP_ALIGN_FRAME, param, 0);
+                    }
+                }
+                break;
             case CMD_SET_AUTO_STOP:
                 DebugPrint(">Auto stop", param);
                 AutoStopEnabled = param;
@@ -491,6 +518,10 @@ void loop() {
                         }
                         break;
                     case CMD_GET_NEXT_FRAME:  // Continue scan to next frame
+                        // A framing pause can outlast the no-film timer while the
+                        // film is stationary. Give detection a fresh transport interval.
+                        FilmDetectedTime = millis() + MaxFilmStallTime;
+                        NoFilmDetected = false;
                         CaptureInProgress = false;
                         ScanState = Sts_Scan;
                         StartFrameTime = micros();
@@ -1279,4 +1310,3 @@ void SerialPrintStr(const char * str) {
 void SerialPrintInt(int i) {
     if (DebugState != DebugInfo) Serial.println(i);
 }
-

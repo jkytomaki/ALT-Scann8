@@ -261,6 +261,7 @@ CMD_SINGLE_STEP = 40
 CMD_ADVANCE_FRAME = 41
 CMD_ADVANCE_FRAME_FRACTION = 42
 CMD_RUN_FILM_COLLECTION = 43
+CMD_ALIGN_FRAME = 44
 CMD_SET_PT_LEVEL = 50
 CMD_SET_MIN_FRAME_STEPS = 52
 CMD_SET_FRAME_FINE_TUNE = 54
@@ -290,6 +291,7 @@ RSP_REPORT_PLOTTER_INFO = 87
 RSP_SCAN_ENDED = 88
 RSP_FILM_FORWARD_ENDED = 89
 RSP_ADVANCE_FRAME_FRACTION = 90
+RSP_ALIGN_FRAME = 91
 
 # Options variables
 ExpertMode = True
@@ -337,9 +339,13 @@ ExposureWbAdaptPause = False
 AutoFineTuneEnabled = True
 offset_image = None # RollingAverage object to allow to automatically set the fine tune value
 auto_fine_tune_wait = 0 # To allow waiting a few frames to allow auto fine tune value to have an effect
-AlignmentGuardMode = 'Pause'
+AlignmentGuardMode = 'Correct'
 AlignmentGuardTolerance = 3.0  # Percent of capture height, independent of the reporting tolerance
 alignment_guard = None
+alignment_firmware_supported = False
+alignment_move_pending = None
+alignment_move_result = None
+alignment_move_token = 0
 alignment_request = None
 alignment_paused = False
 alignment_pause_dialog = None
@@ -1782,14 +1788,18 @@ def adjust_auto_fine_tune():
         return  # Ignore if average offset is less than 0.5% of total height
     direction = 1 if offset_avg > 0 else -1
     step = min(10, max(1, int(abs(offset_avg)/10))) # big steps for big offsets, at least 1 once past the dead band
+    previous_value = FrameFineTuneValue
     FrameFineTuneValue += int(direction * step)
     FrameFineTuneValue = max(5, min(95, FrameFineTuneValue))
     if PreviousFrameFineTuneValue != FrameFineTuneValue:
+        if not send_arduino_command(CMD_SET_FRAME_FINE_TUNE, FrameFineTuneValue):
+            FrameFineTuneValue = previous_value
+            return  # Retain the last known setting and try on a later measured frame.
         PreviousFrameFineTuneValue = FrameFineTuneValue
         auto_fine_tune_limit_warned = False
         logging.debug(f"Average offset is {offset_avg}, adjusting fine tune value by {direction * step} to {FrameFineTuneValue}")
-        send_arduino_command(CMD_SET_FRAME_FINE_TUNE, FrameFineTuneValue)
-        frame_fine_tune_value.set(FrameFineTuneValue)
+        if ExpertMode:
+            frame_fine_tune_value.set(FrameFineTuneValue)
     elif step > 0 and FrameFineTuneValue in (5, 95) and not auto_fine_tune_limit_warned:
         auto_fine_tune_limit_warned = True
         logging.warning(f"Auto fine tune stuck at limit ({FrameFineTuneValue}) with average offset {offset_avg}: "
@@ -2575,6 +2585,8 @@ def set_alignment_status(message):
 def cmd_alignment_guard(_event=None):
     global AlignmentGuardMode, AlignmentGuardTolerance
     if ScanOngoing and not alignment_paused:
+        alignment_guard_mode_var.set(AlignmentGuardMode)
+        alignment_guard_tolerance_var.set(str(AlignmentGuardTolerance))
         return
     AlignmentGuardMode = alignment_guard_mode_var.get()
     try:
@@ -2594,7 +2606,9 @@ def release_alignment_request():
 
 
 def reset_alignment_guard():
-    global alignment_guard, alignment_paused, alignment_pause_dialog
+    global alignment_guard, alignment_paused, alignment_pause_dialog, alignment_move_pending, alignment_move_result
+    alignment_move_pending = None
+    alignment_move_result = None
     release_alignment_request()
     alignment_guard = None
     alignment_paused = False
@@ -2637,6 +2651,33 @@ def pause_alignment_frame(reason, image=None):
     alignment_pause_dialog.protocol('WM_DELETE_WINDOW', stop_alignment_scan)
 
 
+def receive_alignment_response(payload, moved):
+    global alignment_firmware_supported, alignment_move_result
+    if payload == 0:
+        alignment_firmware_supported = Controller_Id == 1 and moved == 1
+        set_alignment_status('Ready: automatic correction available' if alignment_firmware_supported
+                             else 'Correction unavailable; pause protection active')
+    elif alignment_move_pending is not None and payload == alignment_move_pending[0]:
+        alignment_move_result = moved
+    else:
+        logging.warning('Ignoring stale alignment acknowledgement %i', payload)
+
+
+def send_alignment_nudge(steps):
+    global alignment_move_pending, alignment_move_result, alignment_move_token
+    if not alignment_firmware_supported or not 1 <= steps <= 40:
+        return False
+    alignment_move_token = alignment_move_token % 127 + 1
+    payload = alignment_move_token * 256 + steps
+    alignment_move_result = None
+    alignment_move_pending = (payload, time.monotonic() + 3)
+    set_alignment_status(f'Correcting frame {CurrentFrame + 1}: {steps} steps')
+    if not send_arduino_command(CMD_ALIGN_FRAME, payload):
+        alignment_move_pending = None
+        return False
+    return True
+
+
 def prepare_alignment_frame():
     """Check the stationary frame before changing counters, saving, or advancing.
 
@@ -2644,15 +2685,33 @@ def prepare_alignment_frame():
     from a background save thread. A checked request is reused for normal capture.
     """
     global alignment_guard, alignment_request, CaptureSettleDeadline
+    global alignment_move_pending, alignment_move_result
     if SimulatedRun or CameraDisabled:
         return True
     if AlignmentGuardMode == 'Off' and not AutoFineTuneEnabled:
         return True
     if alignment_guard is None:
-        alignment_guard = AlignmentGuard(AlignmentGuardTolerance)
+        alignment_guard = AlignmentGuard(AlignmentGuardTolerance,
+            correct=AlignmentGuardMode == 'Correct' and alignment_firmware_supported and FilmType == 'S8',
+            steps_per_frame=FrameStepsS8 if FilmType == 'S8' else FrameStepsR8)
         CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME) + StabilizationDelayValue / 1000
-    request = capture_settled_request()
+    if alignment_move_pending is not None:
+        payload, deadline = alignment_move_pending
+        if alignment_move_result is None:
+            if time.monotonic() > deadline:
+                alignment_move_pending = None
+                pause_alignment_frame('Timed out waiting for corrective movement; command will not be repeated')
+            return False
+        moved = alignment_move_result
+        alignment_move_pending = None
+        alignment_move_result = None
+        if moved != (payload & 255):
+            pause_alignment_frame('Controller refused corrective movement')
+            return False
+        CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME) + StabilizationDelayValue / 1000
+    request = None
     try:
+        request = capture_settled_request()
         metadata = request.get_metadata()
         exposure_start = (metadata['SensorTimestamp'] - metadata['ExposureTime'] * 1000) / 1e9
         if exposure_start < CaptureSettleDeadline:
@@ -2668,21 +2727,41 @@ def prepare_alignment_frame():
             adjust_auto_fine_tune()
         decision = 'accept' if AlignmentGuardMode == 'Off' else alignment_guard.inspect(measurement)
         if decision == 'accept':
+            if alignment_guard.attempts:
+                logging.info('Alignment corrected before frame %i: %i steps in %i attempts, residual %.1f px',
+                    CurrentFrame + 1, alignment_guard.total_steps, alignment_guard.attempts, measurement.offset)
             alignment_request = request
             request = None  # Ownership transfers to capture_single / capture_hdr.
             alignment_guard = None
             if measurement.offset is None:
                 set_alignment_status('Hole not found; auto fine tune has no feedback')
             else:
-                set_alignment_status(f'Offset {100 * measurement.offset / height:+.1f}%')
+                status = f'Offset {100 * measurement.offset / height:+.1f}%'
+                if AlignmentGuardMode == 'Correct' and not alignment_firmware_supported:
+                    status += '; pause protection only'
+                if AutoFineTuneEnabled and auto_fine_tune_limit_warned:
+                    status += f'; Fine Tune at limit {FrameFineTuneValue}'
+                set_alignment_status(status)
             return True
         if decision == 'confirm':
             # Require another exposure of this same physical frame, not another film frame.
             CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME)
             set_alignment_status('Confirming alignment')
             return False
-        reason = measurement.reason or f'Offset {100 * measurement.offset / height:+.1f}% exceeds {AlignmentGuardTolerance:g}%'
+        if decision == 'nudge':
+            request.release()
+            request = None
+            if not send_alignment_nudge(alignment_guard.next_steps):
+                pause_alignment_frame('Could not send corrective movement; command will not be repeated')
+            return False
+        reason = alignment_guard.reason or measurement.reason or f'Offset {100 * measurement.offset / height:+.1f}% exceeds {AlignmentGuardTolerance:g}%'
+        if AlignmentGuardMode == 'Correct' and not alignment_firmware_supported:
+            reason += '. Automatic correction requires the Nano alignment firmware update'
         pause_alignment_frame(reason, image)
+        return False
+    except (RuntimeError, KeyError, ValueError, cv2.error) as error:
+        logging.exception('Cannot verify stationary frame')
+        pause_alignment_frame(f'Could not verify frame: {error}')
         return False
     finally:
         if request is not None:
@@ -3659,6 +3738,7 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
     global PtLevelValue, StepsPerFrame
     global scan_error_counter, scan_error_total_frames_counter, scan_error_counter_value
     global steps_completed, steps_submitted
+    global alignment_firmware_supported, alignment_move_result
 
     if not SimulatedRun:
         try:
@@ -3705,9 +3785,17 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
             exit_app(False) # If Arduino version not OK exit without saving
         else:
             refresh_qr_code()
+            alignment_firmware_supported = False
+            if Controller_Id == 1:
+                send_arduino_command(CMD_ALIGN_FRAME, 0)
     elif ArduinoTrigger == RSP_FORCE_INIT:  # Controller reloaded, sent init sequence again
         logging.debug("Controller requested to reinit")
+        alignment_firmware_supported = False
+        if ScanOngoing and alignment_guard is not None:
+            pause_alignment_frame('Controller restarted during alignment')
         reinit_controller()
+        if Controller_Id == 1:
+            send_arduino_command(CMD_ALIGN_FRAME, 0)
     elif ArduinoTrigger == RSP_FRAME_AVAILABLE:  # New Frame available
         # Delay shared with arduino, 2 seconds less to avoid conflict with end reel
         last_frame_time = time.time() + max_inactivity_delay - 2
@@ -3753,6 +3841,8 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
     elif ArduinoTrigger == RSP_FILM_FORWARD_ENDED:
         logging.warning("Received film forward end from Arduino")
         cmd_advance_movie(True)
+    elif ArduinoTrigger == RSP_ALIGN_FRAME:
+        receive_alignment_response(ArduinoParam1, ArduinoParam2)
     elif ArduinoTrigger == RSP_ADVANCE_FRAME_FRACTION:  
         logging.debug(f"Received confirmation of {ArduinoParam1} steps done from Arduino")
         steps_completed = True
@@ -4022,9 +4112,9 @@ def load_config_data_pre_init():
                 PlotterEnabled = ConfigData["PlotterMode"]
         if 'UIScrollbars' in ConfigData:
             UIScrollbars = ConfigData["UIScrollbars"]
-        AlignmentGuardMode = ConfigData.get('AlignmentGuardMode', 'Pause')
-        if AlignmentGuardMode not in ('Off', 'Pause'):
-            AlignmentGuardMode = 'Pause'
+        AlignmentGuardMode = ConfigData.get('AlignmentGuardMode', 'Correct')
+        if AlignmentGuardMode not in ('Off', 'Pause', 'Correct'):
+            AlignmentGuardMode = 'Correct'
         AlignmentGuardTolerance = max(0.5, min(10.0, float(ConfigData.get('AlignmentGuardTolerance', 3))))
         if 'DetectMisalignedFrames' in ConfigData:
             DetectMisalignedFrames = ConfigData["DetectMisalignedFrames"]
@@ -6587,10 +6677,10 @@ def create_widgets():
         tk.Label(frame_alignment_frame, text="Alignment guard:", font=("Arial", FontSize - 1)).grid(
             row=frame_align_row, column=0, sticky=W)
         alignment_guard_mode_var = tk.StringVar(value=AlignmentGuardMode)
-        guard_menu = tk.OptionMenu(frame_alignment_frame, alignment_guard_mode_var, 'Off', 'Pause', command=cmd_alignment_guard)
+        guard_menu = tk.OptionMenu(frame_alignment_frame, alignment_guard_mode_var, 'Off', 'Pause', 'Correct', command=cmd_alignment_guard)
         guard_menu.widget_type = 'control'
         guard_menu.grid(row=frame_align_row, column=1, columnspan=2, sticky=E)
-        as_tooltips.add(guard_menu, "Check framing before saving or advancing. Pause keeps the unsaved film frame in place.")
+        as_tooltips.add(guard_menu, "Check framing before saving or advancing. Correct uses bounded forward nudges on supported Nano firmware (S8); otherwise it pauses. Off disables protection.")
         frame_align_row += 1
         tk.Label(frame_alignment_frame, text="Guard tolerance (%):", font=("Arial", FontSize - 1)).grid(
             row=frame_align_row, column=0, sticky=W)
@@ -6601,7 +6691,7 @@ def create_widgets():
         guard_tolerance.bind('<FocusOut>', cmd_alignment_guard)
         guard_tolerance.grid(row=frame_align_row, column=1, columnspan=2, sticky=E)
         frame_align_row += 1
-        alignment_status_var = tk.StringVar(value='Ready')
+        alignment_status_var = tk.StringVar(value='Ready' if alignment_firmware_supported else 'Correction unavailable; pause protection active')
         tk.Label(frame_alignment_frame, textvariable=alignment_status_var, font=("Arial", FontSize - 2),
             wraplength=240).grid(row=frame_align_row, column=0, columnspan=3, sticky=W)
         frame_align_row += 1

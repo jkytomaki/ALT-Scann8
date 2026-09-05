@@ -49,10 +49,35 @@ class FineTuneTests(unittest.TestCase):
             ns = scanner_functions('adjust_auto_fine_tune', offset_image=average,
                 FrameFineTuneValue=start, PreviousFrameFineTuneValue=start,
                 auto_fine_tune_wait=0, auto_fine_tune_limit_warned=False,
-                CaptureResolution='4056x3040', CMD_SET_FRAME_FINE_TUNE=54,
+                CaptureResolution='4056x3040', CMD_SET_FRAME_FINE_TUNE=54, ExpertMode=True,
                 send_arduino_command=sender, frame_fine_tune_value=Mock())
             ns['adjust_auto_fine_tune']()
             sender.assert_called_once_with(54, expected)
+
+
+    def test_basic_mode_does_not_require_expert_widgets(self):
+        average = RollingAverage(5)
+        average.add_value(300)
+        ns = scanner_functions('adjust_auto_fine_tune', offset_image=average,
+            FrameFineTuneValue=20, PreviousFrameFineTuneValue=20,
+            auto_fine_tune_wait=0, auto_fine_tune_limit_warned=False,
+            CaptureResolution='4056x3040', CMD_SET_FRAME_FINE_TUNE=54, ExpertMode=False,
+            send_arduino_command=Mock(return_value=True))
+        ns['adjust_auto_fine_tune']()
+        self.assertEqual(ns['FrameFineTuneValue'], 30)
+
+    def test_failed_setting_write_does_not_claim_success(self):
+        average = RollingAverage(5)
+        average.add_value(300)
+        ns = scanner_functions('adjust_auto_fine_tune', offset_image=average,
+            FrameFineTuneValue=20, PreviousFrameFineTuneValue=20,
+            auto_fine_tune_wait=0, auto_fine_tune_limit_warned=False,
+            CaptureResolution='4056x3040', CMD_SET_FRAME_FINE_TUNE=54, ExpertMode=True,
+            send_arduino_command=Mock(return_value=False), frame_fine_tune_value=Mock())
+        ns['adjust_auto_fine_tune']()
+        self.assertEqual(ns['FrameFineTuneValue'], 20)
+        self.assertEqual(ns['PreviousFrameFineTuneValue'], 20)
+        ns['frame_fine_tune_value'].set.assert_not_called()
 
 
 class SaveTests(unittest.TestCase):
@@ -154,7 +179,10 @@ class PreflightTests(unittest.TestCase):
             AlignmentGuardMode=mode, AlignmentGuardTolerance=3, AlignmentGuard=AlignmentGuard,
             AutoFineTuneEnabled=True, StabilizationDelayValue=0, CaptureSettleDeadline=0,
             capture_settled_request=Mock(side_effect=requests), FrameVCenterImageShift=0,
-            PreviewHeight=500, FilmType='S8', measure_hole=Mock(side_effect=measurements),
+            PreviewHeight=500, FilmType='S8', FrameStepsS8=280, FrameStepsR8=240,
+            alignment_firmware_supported=False, alignment_move_pending=None, alignment_move_result=None,
+            auto_fine_tune_limit_warned=False,
+            CurrentFrame=42, send_alignment_nudge=Mock(return_value=True), measure_hole=Mock(side_effect=measurements),
             offset_image=average, CaptureResolution='4056x3040', adjust_auto_fine_tune=Mock(),
             set_alignment_status=Mock(), pause_alignment_frame=Mock())
         return ns, requests
@@ -190,6 +218,123 @@ class PreflightTests(unittest.TestCase):
         ns['pause_alignment_frame'].assert_called_once()
         requests[0].release.assert_called_once()
         ns['measure_hole'].assert_not_called()
+
+
+
+
+class CorrectionTests(unittest.TestCase):
+    def test_corrects_19_percent_shift_without_advancing_to_another_film_frame(self):
+        guard = AlignmentGuard(3, correct=True, steps_per_frame=280)
+        offset = 588.0
+        self.assertEqual(guard.inspect(HoleMeasurement(offset, 3040)), 'confirm')
+        while True:
+            decision = guard.inspect(HoleMeasurement(offset, 3040))
+            if decision == 'accept':
+                break
+            self.assertEqual(decision, 'nudge', guard.reason)
+            self.assertLessEqual(guard.next_steps, 40)
+            offset -= guard.next_steps * 8.8  # Measured pitch can be smaller than sensor height.
+        self.assertLessEqual(abs(offset), 3040 * 0.015)
+        self.assertLessEqual(guard.attempts, 4)
+        self.assertLessEqual(guard.total_steps, 280 // 3)
+
+    def test_refuses_reverse_motion_and_overshoot(self):
+        guard = AlignmentGuard(3, correct=True, steps_per_frame=280)
+        guard.inspect(HoleMeasurement(500, 3040))
+        self.assertEqual(guard.inspect(HoleMeasurement(500, 3040)), 'nudge')
+        self.assertEqual(guard.inspect(HoleMeasurement(-200, 3040)), 'pause')
+        self.assertIn('reversal', guard.reason)
+
+    def test_no_progress_cannot_loop_forever(self):
+        guard = AlignmentGuard(3, correct=True, steps_per_frame=280)
+        guard.inspect(HoleMeasurement(500, 3040))
+        guard.inspect(HoleMeasurement(500, 3040))
+        self.assertEqual(guard.inspect(HoleMeasurement(500, 3040)), 'pause')
+        self.assertEqual(guard.attempts, 1)
+
+    def test_disagreeing_exposures_never_move_film(self):
+        guard = AlignmentGuard(3, correct=True, steps_per_frame=280)
+        guard.inspect(HoleMeasurement(500, 3040))
+        self.assertEqual(guard.inspect(HoleMeasurement(300, 3040)), 'pause')
+        self.assertEqual(guard.total_steps, 0)
+
+    def test_total_movement_is_bounded_even_with_slow_progress(self):
+        guard = AlignmentGuard(3, correct=True, steps_per_frame=280)
+        guard.inspect(HoleMeasurement(1200, 3040))
+        for offset in (1200, 1100, 1000, 900, 800):
+            if guard.inspect(HoleMeasurement(offset, 3040)) == 'pause':
+                break
+        else:
+            self.fail('Guard never paused')
+        self.assertLessEqual(guard.total_steps, 280 // 3)
+        self.assertLessEqual(guard.attempts, 4)
+
+
+class MovementProtocolTests(unittest.TestCase):
+    preflight = PreflightTests.preflight
+
+    def test_old_firmware_pauses_without_sending_motion(self):
+        ns, _ = self.preflight([HoleMeasurement(200, 1000), HoleMeasurement(200, 1000)], mode='Correct')
+        ns['prepare_alignment_frame']()
+        ns['prepare_alignment_frame']()
+        ns['send_alignment_nudge'].assert_not_called()
+        self.assertIn('firmware update', ns['pause_alignment_frame'].call_args.args[0])
+
+    def test_waits_for_ack_before_acquiring_another_exposure(self):
+        ns, _ = self.preflight([HoleMeasurement(0, 1000)])
+        ns['alignment_guard'] = AlignmentGuard()
+        ns['alignment_move_pending'] = (256 + 20, time.monotonic() + 3)
+        self.assertFalse(ns['prepare_alignment_frame']())
+        ns['capture_settled_request'].assert_not_called()
+        ns['pause_alignment_frame'].assert_not_called()
+
+    def test_timed_out_motion_is_not_repeated(self):
+        ns, _ = self.preflight([HoleMeasurement(0, 1000)])
+        ns['alignment_guard'] = AlignmentGuard()
+        ns['alignment_move_pending'] = (256 + 20, time.monotonic() - 1)
+        self.assertFalse(ns['prepare_alignment_frame']())
+        ns['capture_settled_request'].assert_not_called()
+        ns['send_alignment_nudge'].assert_not_called()
+        ns['pause_alignment_frame'].assert_called_once()
+
+    def test_refused_motion_never_saves_or_moves_again(self):
+        ns, _ = self.preflight([HoleMeasurement(0, 1000)])
+        ns['alignment_guard'] = AlignmentGuard()
+        ns['alignment_move_pending'] = (256 + 20, time.monotonic() + 3)
+        ns['alignment_move_result'] = 0
+        self.assertFalse(ns['prepare_alignment_frame']())
+        ns['capture_settled_request'].assert_not_called()
+        ns['send_alignment_nudge'].assert_not_called()
+        ns['pause_alignment_frame'].assert_called_once()
+
+    def test_ack_resets_settle_deadline_before_rechecking(self):
+        ns, _ = self.preflight([HoleMeasurement(0, 1000)])
+        ns['alignment_guard'] = AlignmentGuard()
+        ns['alignment_move_pending'] = (256 + 20, time.monotonic() + 3)
+        ns['alignment_move_result'] = 20
+        ns['StabilizationDelayValue'] = 250
+        before = time.clock_gettime(time.CLOCK_BOOTTIME)
+        self.assertTrue(ns['prepare_alignment_frame']())
+        self.assertGreaterEqual(ns['CaptureSettleDeadline'], before + 0.25)
+
+    def test_stale_ack_cannot_complete_a_different_move(self):
+        ns = scanner_functions('receive_alignment_response', Controller_Id=1,
+            alignment_move_pending=(532, time.monotonic() + 3), alignment_move_result=None,
+            alignment_firmware_supported=True, set_alignment_status=Mock())
+        ns['receive_alignment_response'](276, 20)
+        self.assertIsNone(ns['alignment_move_result'])
+        ns['receive_alignment_response'](532, 20)
+        self.assertEqual(ns['alignment_move_result'], 20)
+
+    def test_i2c_send_failure_clears_pending_without_retry(self):
+        sender = Mock(return_value=False)
+        ns = scanner_functions('send_alignment_nudge', alignment_move_token=0,
+            alignment_firmware_supported=True, alignment_move_pending=None,
+            alignment_move_result=None, CurrentFrame=42, set_alignment_status=Mock(),
+            send_arduino_command=sender, CMD_ALIGN_FRAME=44)
+        self.assertFalse(ns['send_alignment_nudge'](20))
+        sender.assert_called_once_with(44, 276)
+        self.assertIsNone(ns['alignment_move_pending'])
 
 
 if __name__ == '__main__':
