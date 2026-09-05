@@ -183,6 +183,8 @@ boolean IsS8 = true;
 
 boolean TractionSwitchActive = false;  // When traction micro-switch is closed
 boolean TractionSwitchActiveLast = false;  // Last value of traction micro-switch, to detect changes
+boolean CaptureInProgress = false;     // Between telling RPi a frame is available and RPi asking for the next
+                                       // one: film must not move, so outgoing film collection is suspended
 
 unsigned long StartFrameTime = 0;           // Time at which we get RPi command to get next frame (stats only)
 unsigned long StartPictureSaveTime = 0;     // Time at which we tell RPi to save current frame (stats only)
@@ -409,6 +411,7 @@ void loop() {
             case CMD_STOP_SCAN:
                 DebugPrintStr(">Scan stop");
                 FrameDetected = false;
+                CaptureInProgress = false;
                 LastFrameSteps = 0;
                 if (UVLedOn) {
                     analogWrite(11, 0); // Turn off UV LED
@@ -429,7 +432,8 @@ void loop() {
                 EndScanNotificationSent = true; // Prevent sending multiple times
                 SendToRPi(RSP_SCAN_ENDED, 0, 0);
             }
-            CollectOutgoingFilm();
+            if (!CaptureInProgress)  // Collecting tugs the film; do not do it while RPi is capturing
+                CollectOutgoingFilm();
         }
 
         switch (ScanState) {
@@ -459,6 +463,7 @@ void loop() {
                         SendToRPi(RSP_VERSION_ID, cnt_ver_1 * 256 + 1, cnt_ver_2 * 256 + cnt_ver_3);  // 1 - Arduino, 2 - RPi Pico
                         break;
                     case CMD_START_SCAN:
+                        CaptureInProgress = false;
                         tone(A2, 2000, 50); // Beep to indicate start of scanning
                         delay(100);     // Delay to avoind beep interfering with uv led PWB (both use same timer)
                         SetReelsAsNeutral(HIGH, LOW, LOW);
@@ -486,6 +491,7 @@ void loop() {
                         }
                         break;
                     case CMD_GET_NEXT_FRAME:  // Continue scan to next frame
+                        CaptureInProgress = false;
                         ScanState = Sts_Scan;
                         StartFrameTime = micros();
                         ScanSpeedDelay = OriginalScanSpeedDelay;
@@ -631,6 +637,7 @@ void loop() {
                         break;
                     case SCAN_FRAME_DETECTED:
                         ScanState = Sts_Idle; // Exit scan loop
+                        CaptureInProgress = true;
                         SendToRPi(RSP_FRAME_AVAILABLE, LastFrameSteps, LastPTLevel);
                         break;
                     case SCAN_TERMINATION_REQUESTED:
