@@ -2547,11 +2547,20 @@ def capture_settled_request():
         request = camera.capture_request()
         metadata = request.get_metadata()
         exposure_start = (metadata['SensorTimestamp'] - metadata['ExposureTime'] * 1000) / 1e9
-        if exposure_start >= CaptureSettleDeadline or rejected >= 5:
+        if exposure_start >= CaptureSettleDeadline:
             if rejected:
                 logging.debug(f"Settle guard: discarded {rejected} early frame(s) for frame {CurrentFrame}")
-            if rejected >= 5:
-                logging.warning(f"Settle guard: giving up after {rejected} early frames, timestamps suspect")
+            return request
+        # Give up only once waiting longer cannot help: with the sensor free-running,
+        # a frame exposed after the deadline must complete within about two frame
+        # periods past it. A fixed rejection count fails open with long exposures
+        # (frame period grows with exposure time), capturing before the film settled.
+        frame_period = metadata.get('FrameDuration', 100000) / 1e6
+        if time.clock_gettime(time.CLOCK_BOOTTIME) > CaptureSettleDeadline + 2 * frame_period + 0.25:
+            logging.warning(
+                f"Settle guard: giving up for frame {CurrentFrame} after {rejected} early frames "
+                f"(exposure_start-deadline={round((exposure_start - CaptureSettleDeadline) * 1000)} ms, "
+                f"ExposureTime={metadata['ExposureTime']} us, FrameDuration={metadata['FrameDuration']} us)")
             return request
         request.release()
         rejected += 1
