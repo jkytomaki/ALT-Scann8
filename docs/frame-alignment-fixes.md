@@ -99,6 +99,20 @@ up to ten ratio points per adjustment, two measured frames between adjustments),
 along with transport tension/slip. A controlled comparison with fixed Fine Tune
 and per-frame offset/threshold/step telemetry is needed to distinguish them.
 
+After restarting at frame 3700 on September 6, 49 of frames 3701–3795 required
+forward correction. Frame 3795 needed 28 steps and finished at -3 pixels;
+3796 onward initially needed no correction. Fine Tune reached 95 with an average
+offset of +402 pixels during the run. Settings were manual minimum 250 steps,
+automatic PT level, automatic Fine Tune, and 8% guard tolerance. No YOLO calls
+were logged during this run. A separate disagreement pause occurred at frame 3829.
+
+The restart loaded Fine Tune 25 from the session file: automatic changes had
+updated the live value but not the configuration. Successful automatic updates
+now also update the global and film-specific saved trim values, which are written
+by normal session saving. Failed I2C writes leave those values untouched. Trim
+changes are logged at INFO to make later oscillations traceable. This fixes stale
+trim restoration; it does not establish the cause of every undershoot episode.
+
 ## Nano firmware
 
 `ALT-Scann8-Controller.ino` is now version **1.1.12**. The Pico variants are not

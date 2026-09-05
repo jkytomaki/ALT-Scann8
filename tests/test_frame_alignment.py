@@ -23,7 +23,8 @@ def scanner_functions(*names, **state):
     tree = ast.parse(SOURCE.read_text())
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert len(nodes) == len(names)
-    ns = dict(cv2=cv2, np=np, logging=logging, time=time, Image=Image)
+    ns = dict(cv2=cv2, np=np, logging=logging, time=time, Image=Image,
+              ConfigData={}, FilmType='S8')
     ns.update(state)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), 'exec'), ns)
     return ns
@@ -106,6 +107,8 @@ class FineTuneTests(unittest.TestCase):
                 send_arduino_command=sender, frame_fine_tune_value=Mock())
             ns['adjust_auto_fine_tune']()
             sender.assert_called_once_with(54, expected)
+            self.assertEqual(ns['ConfigData']['FrameFineTune'], expected)
+            self.assertEqual(ns['ConfigData']['FrameFineTuneS8'], expected)
 
 
     def test_basic_mode_does_not_require_expert_widgets(self):
@@ -131,6 +134,7 @@ class FineTuneTests(unittest.TestCase):
         self.assertEqual(ns['FrameFineTuneValue'], 20)
         self.assertEqual(ns['PreviousFrameFineTuneValue'], 20)
         ns['frame_fine_tune_value'].set.assert_not_called()
+        self.assertNotIn('FrameFineTune', ns['ConfigData'])
 
 
 class SaveTests(unittest.TestCase):

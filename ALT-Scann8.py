@@ -1799,8 +1799,13 @@ def adjust_auto_fine_tune():
             FrameFineTuneValue = previous_value
             return  # Retain the last known setting and try on a later measured frame.
         PreviousFrameFineTuneValue = FrameFineTuneValue
+        # Restore the last accepted trim after restarting, rather than the
+        # old manual value from before automatic feedback converged.
+        ConfigData['FrameFineTune'] = FrameFineTuneValue
+        ConfigData['FrameFineTune' + FilmType] = FrameFineTuneValue
         auto_fine_tune_limit_warned = False
-        logging.debug(f"Average offset is {offset_avg}, adjusting fine tune value by {direction * step} to {FrameFineTuneValue}")
+        logging.info('Auto fine tune %i -> %i, average offset %i px',
+                     previous_value, FrameFineTuneValue, offset_avg)
         if ExpertMode:
             frame_fine_tune_value.set(FrameFineTuneValue)
     elif step > 0 and FrameFineTuneValue in (5, 95) and not auto_fine_tune_limit_warned:
