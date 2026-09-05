@@ -164,6 +164,7 @@ ScanOngoing = False  # PlayState in original code from Torulf (opposite meaning)
 FrameDetectMode = 'PFD'    # By default scanner works in traditional mode, with Phototransistor Frame Detection (vs VFD)
 ScanStopRequested = False  # To handle stopping scan process asynchronously, with same button as start scan
 NewFrameAvailable = False  # To be set to true upon reception of Arduino event
+RetryingFrame = False  # True while re-capturing a frame after an Arduino I/O error, to avoid re-counting it
 ScanProcessError = False  # To be set to true upon reception of Arduino event
 ScanProcessError_LastTime = 0
 # Directory where python scrips run, to store the json file with persistent data
@@ -341,6 +342,7 @@ ExposureWbAdaptPause = False
 AutoFineTuneEnabled = True
 offset_image = None # RollingAverage object to allow to automatically set the fine tune value
 auto_fine_tune_wait = 0 # To allow waiting a few frames to allow auto fine tune value to have an effect
+auto_fine_tune_limit_warned = False # To warn only once while auto fine tune is stuck at a range limit
 FrameVCenterEnabled = False
 FrameVCenterImage = None    # Used to temporarily save the imag eused to allow the user to vertically center the image
 FrameVCenterHoleShift = 0   # Offset of the hole center respect to the image center
@@ -1559,7 +1561,7 @@ def rwnd_speed_up():
 
 def cmd_frame_extra_steps_selection():
     global FrameExtraStepsValue
-    FrameExtraStepsValue = value_normalize(frame_extra_steps_value, 0, 150, 0)
+    FrameExtraStepsValue = value_normalize(frame_extra_steps_value, -30, 150, 0)
     ConfigData["FrameExtraSteps"] = FrameExtraStepsValue
     send_arduino_command(CMD_SET_EXTRA_STEPS, FrameExtraStepsValue)
 
@@ -1760,7 +1762,7 @@ def debug_display_image(window_name, img, factor=1):
 
 
 def adjust_auto_fine_tune():
-    global FrameFineTuneValue, PreviousFrameFineTuneValue, auto_fine_tune_wait
+    global FrameFineTuneValue, PreviousFrameFineTuneValue, auto_fine_tune_wait, auto_fine_tune_limit_warned
     offset_avg = offset_image.get_average()
     if offset_avg == None:
         return  # Too early as to rely on average (less than 50 samples)
@@ -1772,7 +1774,7 @@ def adjust_auto_fine_tune():
     if abs(offset_avg) < int(CaptureResolution.split("x")[1])*0.005:
         return  # Ignore if average offset is less than 0.5% of total height
     direction = 1 if offset_avg > 0 else -1
-    step = min(10, int(abs(offset_avg)/10)) # big steps for big offsets
+    step = min(10, max(1, int(abs(offset_avg)/10))) # big steps for big offsets, at least 1 once past the dead band
     FrameFineTuneValue += int(direction * step)
     if FrameFineTuneValue < 0:
         FrameFineTuneValue = 0
@@ -1780,9 +1782,14 @@ def adjust_auto_fine_tune():
         FrameFineTuneValue = 100
     if PreviousFrameFineTuneValue != FrameFineTuneValue:
         PreviousFrameFineTuneValue = FrameFineTuneValue
+        auto_fine_tune_limit_warned = False
         logging.debug(f"Average offset is {offset_avg}, adjusting fine tune value by {direction * step} to {FrameFineTuneValue}")
         send_arduino_command(CMD_SET_FRAME_FINE_TUNE, FrameFineTuneValue)
         frame_fine_tune_value.set(FrameFineTuneValue)
+    elif step > 0 and FrameFineTuneValue in (0, 100) and not auto_fine_tune_limit_warned:
+        auto_fine_tune_limit_warned = True
+        logging.warning(f"Auto fine tune stuck at limit ({FrameFineTuneValue}) with average offset {offset_avg}: "
+                        "cannot correct further, adjust steps per frame, extra steps or PT level")
     auto_fine_tune_wait = 2    # wait 5 frames to see the effect of this change
 
 
@@ -1810,7 +1817,11 @@ def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice
 
     # Adjust VCenter (not all films have the frames vertically centered respect to the holes)
     if compensate:
-        middle += FrameVCenterImageShift
+        # FrameVCenterImageShift is measured on the preview image, scale it to the height of the image being checked
+        if PreviewHeight > 0:
+            middle += int(FrameVCenterImageShift * height / PreviewHeight)
+        else:
+            middle += FrameVCenterImageShift
 
     # Calculate margin
     margin = height*threshold//100
@@ -1977,16 +1988,21 @@ def capture_save_thread(queue, event, id):
                     captured_image = np.array(captured_image)
                 logging.debug("Thread %i saved image: %s ms", id,
                               str(round((time.time() - curtime) * 1000, 1)))
-            frame_centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
-            offset_image.add_value(offset)
-            if AutoFineTuneEnabled:
-                adjust_auto_fine_tune()
-            if DetectMisalignedFrames and hdr_idx <= 1 and not frame_centered:
-                scan_error_counter += 1
-                if scan_error_total_frames_counter > 0:
-                    scan_error_counter_value.set(f"{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)")
-                with open(scan_error_log_fullpath, 'a') as f:
-                    f.write(f"Misaligned frame, {CurrentFrame}\n")
+            # captured_image is only bound for whole-image (IMAGE_TOKEN) frames or when
+            # misalignment detection asked for the array (REQUEST_TOKEN path). Guard the
+            # check so PNG or HDR sub-frame scans with detection off do not dereference an
+            # unbound captured_image here. Alignment only applies to the base frame (hdr_idx <= 1).
+            if hdr_idx <= 1 and (type == IMAGE_TOKEN or DetectMisalignedFrames):
+                frame_centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
+                offset_image.add_value(offset)
+                if AutoFineTuneEnabled:
+                    adjust_auto_fine_tune()
+                if DetectMisalignedFrames and not frame_centered:
+                    scan_error_counter += 1
+                    if scan_error_total_frames_counter > 0:
+                        scan_error_counter_value.set(f"{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)")
+                    with open(scan_error_log_fullpath, 'a') as f:
+                        f.write(f"Misaligned frame, {frame_idx}\n")
             logging.debug("Thread %i after checking misaligned frames", id)
         aux = time.time() - curtime
         total_wait_time_save_image += aux
@@ -2564,11 +2580,20 @@ def capture_settled_request():
         request = camera.capture_request()
         metadata = request.get_metadata()
         exposure_start = (metadata['SensorTimestamp'] - metadata['ExposureTime'] * 1000) / 1e9
-        if exposure_start >= CaptureSettleDeadline or rejected >= 5:
+        if exposure_start >= CaptureSettleDeadline:
             if rejected:
                 logging.debug(f"Settle guard: discarded {rejected} early frame(s) for frame {CurrentFrame}")
-            if rejected >= 5:
-                logging.warning(f"Settle guard: giving up after {rejected} early frames, timestamps suspect")
+            return request
+        # Give up only once waiting longer cannot help: with the sensor free-running,
+        # a frame exposed after the deadline must complete within about two frame
+        # periods past it. A fixed rejection count fails open with long exposures
+        # (frame period grows with exposure time), capturing before the film settled.
+        frame_period = metadata.get('FrameDuration', 100000) / 1e6
+        if time.clock_gettime(time.CLOCK_BOOTTIME) > CaptureSettleDeadline + 2 * frame_period + 0.25:
+            logging.warning(
+                f"Settle guard: giving up for frame {CurrentFrame} after {rejected} early frames "
+                f"(exposure_start-deadline={round((exposure_start - CaptureSettleDeadline) * 1000)} ms, "
+                f"ExposureTime={metadata['ExposureTime']} us, FrameDuration={metadata['FrameDuration']} us)")
             return request
         request.release()
         rejected += 1
@@ -2998,7 +3023,7 @@ def start_scan():
     global ScanOngoing
     global CurrentScanStartFrame, CurrentScanStartTime
     global ScanStopRequested
-    global NewFrameAvailable
+    global NewFrameAvailable, RetryingFrame
     global total_wait_time_autoexp, total_wait_time_awb, total_wait_time_preview_display, session_start_time
     global total_wait_time_save_image
     global session_frames
@@ -3042,6 +3067,10 @@ def start_scan():
         # Set new frame indicator to false, in case this is the cause of the strange
         # behaviour after stopping/restarting the scan process
         NewFrameAvailable = False
+        # Clear any stop/retry request left over from a previous (or aborted) scan, so a
+        # stale flag cannot immediately stop this one on the first capture_loop iteration.
+        ScanStopRequested = False
+        RetryingFrame = False
 
         # Enable/Disable related buttons
         except_widget_global_enable([start_btn], not ScanOngoing)
@@ -3092,7 +3121,7 @@ def capture_loop():
     global win
     global CurrentFrame
     global FramesPerMinute, FramesToGo
-    global NewFrameAvailable
+    global NewFrameAvailable, RetryingFrame
     global ScanProcessError, ScanProcessError_LastTime
     global ScanStopRequested
     global session_frames, CurrentStill
@@ -3198,38 +3227,52 @@ def capture_loop():
                 vfd_attempts_on_same_frame = 0
             # If centered, or gone too far, or offset too small to handle, let the code flow in the standard flow to do the normal capture
         if NewFrameAvailable:
-            # Update remaining time
-            aux = frames_to_go_str.get()
-            if aux.isdigit() and time.time() > frames_to_go_key_press_time:
-                FramesToGo = int(aux)
-                if FramesToGo > 0:
-                    FramesToGo -= 1
-                    frames_to_go_str.set(str(FramesToGo))
-                    ConfigData["FramesToGo"] = FramesToGo
-                    if FramesPerMinute != 0:
-                        minutes_pending = FramesToGo // FramesPerMinute
-                        frames_to_go_time_str.set(f"{(minutes_pending // 60):02}h {(minutes_pending % 60):02}m")
-                else:
-                    if AutoStopEnabled and autostop_type.get() == "counter_to_zero":
-                        ScanStopRequested = True  # Stop in next capture loop
-                    ConfigData["FramesToGo"] = -1
-                    frames_to_go_str.set('')  # clear frames to go box to prevent it stops again in next scan
-            CurrentFrame += 1
-            session_frames += 1
-            register_frame()
-            CurrentStill = 1
-            capture('normal')
+            if not RetryingFrame:
+                # Update remaining time
+                aux = frames_to_go_str.get()
+                if aux.isdigit() and time.time() > frames_to_go_key_press_time:
+                    FramesToGo = int(aux)
+                    if FramesToGo > 0:
+                        FramesToGo -= 1
+                        frames_to_go_str.set(str(FramesToGo))
+                        ConfigData["FramesToGo"] = FramesToGo
+                        if FramesPerMinute != 0:
+                            minutes_pending = FramesToGo // FramesPerMinute
+                            frames_to_go_time_str.set(f"{(minutes_pending // 60):02}h {(minutes_pending % 60):02}m")
+                    else:
+                        # Requested frame count reached: clear the box and, if auto-stop is
+                        # armed, stop now WITHOUT capturing an extra frame (this block used
+                        # to fall through and grab one frame beyond the requested count).
+                        ConfigData["FramesToGo"] = -1
+                        frames_to_go_str.set('')  # clear frames to go box to prevent it stops again in next scan
+                        if AutoStopEnabled and autostop_type.get() == "counter_to_zero":
+                            ScanStopRequested = True  # Stop in next capture loop
+                            win.after(5, capture_loop)
+                            return
+                CurrentFrame += 1
+                session_frames += 1
+                register_frame()
+                CurrentStill = 1
+                capture('normal')
+            # On a retry (RetryingFrame) the frame was already captured and queued for
+            # saving on the first attempt, so we do NOT capture again - that would queue a
+            # second async save of the same filename. We only re-send the advance command.
             if FrameDetectMode == 'PFD':
                 if not SimulatedRun:
-                    try:
-                        # Set NewFrameAvailable to False here, to avoid overwriting new frame from arduino
-                        NewFrameAvailable = False
-                        logging.debug("Frame %i captured.", CurrentFrame)
-                        send_arduino_command(CMD_GET_NEXT_FRAME)  # Tell Arduino to move to next frame
-                    except IOError:
-                        CurrentFrame -= 1
+                    # Set NewFrameAvailable to False here, to avoid overwriting new frame from arduino
+                    NewFrameAvailable = False
+                    logging.debug("Frame %i captured.", CurrentFrame)
+                    # send_arduino_command() swallows the I2C IOError internally and reports it
+                    # via its return value, so check that instead of relying on an exception
+                    # (which never propagates out of send_arduino_command).
+                    if send_arduino_command(CMD_GET_NEXT_FRAME):  # Tell Arduino to move to next frame
+                        RetryingFrame = False
+                    else:
+                        # The command did not reach the Arduino, so the frame has NOT advanced.
+                        # Retry the SAME frame without rolling back or re-advancing the counters,
+                        # so FramesToGo / session_frames are not double-counted on the retry.
                         NewFrameAvailable = True  # Set NewFrameAvailable to True to repeat next time
-                        # Log error to console
+                        RetryingFrame = True
                         logging.warning("Error while telling Arduino to move to next Frame.")
                         logging.warning("Frame %i capture to be tried again.", CurrentFrame)
                         win.after(5, capture_loop)
@@ -3435,11 +3478,12 @@ def send_arduino_command(cmd, param=0):
             i2c.write_i2c_block_data(16, cmd, [int(param % 256), int(param >> 8)])  # Send command to Arduino
         except IOError:
             logging.warning(
-                f"Error while sending command {cmd} (param {param}) to Arduino while handling frame {CurrentFrame}. "
-                f"Retrying...")
+                f"Error while sending command {cmd} (param {param}) to Arduino while handling frame {CurrentFrame}.")
             time.sleep(0.2)  # wait 100 µs, to avoid I/O errors
+            return False  # Report the failure; callers that must not miss the command can react
 
         time.sleep(0.0001)  # wait 100 µs, same
+    return True
 
 
 def arduino_listen_loop():  # Waits for Arduino communicated events and dispatches accordingly
@@ -3522,7 +3566,8 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
             f.write(f"No Frame detected, {CurrentFrame}, {ArduinoParam1}, {ArduinoParam2}\n")
     elif ArduinoTrigger == RSP_SCAN_ENDED:  # Scan arrived at the end of the reel
         logging.warning("End of reel reached: Scan terminated")
-        ScanStopRequested = True
+        if ScanOngoing:  # Only act if a scan is actually running; otherwise a late/spurious
+            ScanStopRequested = True  # end-of-reel event would arm the flag for the next scan
     elif ArduinoTrigger == RSP_REPORT_AUTO_LEVELS:  # Get auto levels from Arduino, to be displayed in UI, if auto on
         if ExpertMode:
             if (AutoPtLevelEnabled):
@@ -4129,7 +4174,7 @@ def load_session_data_post_init():
                     send_arduino_command(CMD_SET_FRAME_FINE_TUNE, FrameFineTuneValue)
                 if 'FrameExtraSteps' in ConfigData:
                     FrameExtraStepsValue = ConfigData["FrameExtraSteps"]
-                    FrameExtraStepsValue = min(FrameExtraStepsValue, 150)
+                    FrameExtraStepsValue = max(-30, min(FrameExtraStepsValue, 150))
                     frame_extra_steps_value.set(FrameExtraStepsValue)
                     send_arduino_command(CMD_SET_EXTRA_STEPS, FrameExtraStepsValue)
                 if 'PTLevelAuto' in ConfigData:     # Delete legacy name, replace with new
@@ -4904,6 +4949,7 @@ def draw_static_arrows(canvas, width, height):
 def cmd_set_frame_vcenter():
     global FrameVCenterEnabled, FrameVCenterImage, save_canvas_image
     global FrameVCenterHoleShift, FrameVCenterImageShift
+    global FrameVCenterImageShiftS8, FrameVCenterImageShiftR8
 
     if IsSplashDisplayed:
         tk.messagebox.showinfo(
@@ -4938,8 +4984,8 @@ def cmd_set_frame_vcenter():
         width, height = FrameVCenterImage.size
         # Draw a line in the middle of the hole(s)
         draw = ImageDraw.Draw(FrameVCenterImage)
-        start_point = (0, height // 2 - FrameVCenterHoleShift)
-        end_point = (20, height // 2 - FrameVCenterHoleShift)
+        start_point = (0, height // 2 + FrameVCenterHoleShift)
+        end_point = (20, height // 2 + FrameVCenterHoleShift)
         line_color = (255, 0, 0)  # Red color (RGB)
         draw.line([start_point, end_point], fill=line_color, width=3)
         # Draw some explanatory text
@@ -4956,7 +5002,8 @@ def cmd_set_frame_vcenter():
         draw_outlined_text(draw, text_position, text_content, fill=text_color, outline_color="black", font=font)
         # Finally, add the line and text to the image
         new_image = Image.new("RGB", (width, height), (0, 0, 0, 0))  # Create new image.
-        new_image.paste(FrameVCenterImage, (0, FrameVCenterImageShift+FrameVCenterHoleShift))
+        # Shift image by -FrameVCenterHoleShift so hole center starts aligned with the reference line
+        new_image.paste(FrameVCenterImage, (0, FrameVCenterImageShift-FrameVCenterHoleShift))
         photo_image = ImageTk.PhotoImage(new_image)
         draw_capture_canvas.itemconfig(draw_capture_canvas_image_id, image=photo_image)
         draw_capture_canvas.image = photo_image
@@ -4965,10 +5012,15 @@ def cmd_set_frame_vcenter():
         if not hasattr(draw_capture_canvas, "arrows_drawn"):
             draw_static_arrows(draw_capture_canvas, width, height)
             draw_capture_canvas.arrows_drawn = True  # Set a flag so we don't draw them again
-    else:  # Button released, save final value (calculating proportion between previen and real image)
+    else:  # Button released, save final value (in preview pixels, scaled to real image height when applied)
         # First, draw back S8/R8 markers
         display_left_markers()
         ConfigData["FrameVCenterImageShift" + ConfigData["FilmType"]] = FrameVCenterImageShift
+        # Keep the per-film-type value in sync, otherwise switching film type restores the stale startup value
+        if ConfigData["FilmType"] == "S8":
+            FrameVCenterImageShiftS8 = FrameVCenterImageShift
+        else:
+            FrameVCenterImageShiftR8 = FrameVCenterImageShift
         # Save image to restore it when done
         draw_capture_canvas.itemconfig(draw_capture_canvas_image_id, image=save_canvas_image)
         draw_capture_canvas.image = save_canvas_image
@@ -4987,7 +5039,7 @@ def cmd_frame_vcenter_selection():
     # Arrange image according to user-defined displacement
     width, height = FrameVCenterImage.size
     new_image = Image.new("RGB", (width, height), (0, 0, 0, 0))  # Create new image.
-    new_image.paste(FrameVCenterImage, (0, FrameVCenterImageShift+FrameVCenterHoleShift))
+    new_image.paste(FrameVCenterImage, (0, FrameVCenterImageShift-FrameVCenterHoleShift))
     photo_image = ImageTk.PhotoImage(new_image)
     draw_capture_canvas.itemconfig(draw_capture_canvas_image_id, image=photo_image)
     draw_capture_canvas.image = photo_image
@@ -6350,16 +6402,16 @@ def create_widgets():
 
         frame_extra_steps_value = tk.IntVar(value=FrameExtraStepsValue)  # To be overridden by config
         frame_extra_steps_spinbox = DynamicSpinbox(frame_alignment_frame, command=cmd_frame_extra_steps_selection, width=5,
-                                                   readonlybackground='pale green', from_=0, to=150,
+                                                   readonlybackground='pale green', from_=-30, to=150,
                                                    textvariable=frame_extra_steps_value, font=("Arial", FontSize - 1),
                                                    name='frame_extra_steps_spinbox')
         frame_extra_steps_spinbox.widget_type = "control"
         frame_extra_steps_spinbox.grid(row=frame_align_row, column=1, columnspan=2, padx=x_pad, pady=y_pad, sticky=E)
         cmd_extra_steps_validation_cmd = frame_extra_steps_spinbox.register(extra_steps_validation)
         frame_extra_steps_spinbox.configure(validate="key", validatecommand=(cmd_extra_steps_validation_cmd, '%P'))
-        as_tooltips.add(frame_extra_steps_spinbox, "Unconditionally advances/detects the frame n steps after/before "
-                                                   "detection (n between 0 and 30). Negative values can help if "
-                                                   "film gate is not correctly positioned.")
+        as_tooltips.add(frame_extra_steps_spinbox, "Unconditionally advances the frame n steps after detection "
+                                                   "(1 to 30). Negative values (-30 to -1) reduce the minimum steps "
+                                                   "per frame instead, can help if film gate is not correctly positioned.")
         frame_extra_steps_spinbox.bind("<FocusOut>", lambda event: cmd_frame_extra_steps_selection())
         frame_align_row += 1
 
