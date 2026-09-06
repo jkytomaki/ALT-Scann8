@@ -114,6 +114,7 @@ from rolling_average import RollingAverage
 from frame_alignment import AlignmentGuard, ForwardRecovery, HoleMeasurement, measure_hole
 from alignment_feedback import FineTuner, AlignmentStatistics
 from alignment_statistics_view import AlignmentStatisticsWindow
+from proxy_jpeg import ProxyJpegWriter, capture_proxy_image
 from sprocket_yolo import YoloWorker
 
 #  ######### Global variable definition ##########
@@ -314,6 +315,8 @@ WidgetsEnabledWhileScanning = True
 TempInFahrenheit = False
 CaptureResolution = '2028x1520'
 FileType = 'jpg'
+ProxyJpegEnabled = False
+proxy_jpeg_writer = ProxyJpegWriter()
 # Other options (experimental, expert...)
 PreviewModuleValue = 1
 NegativeImage = False
@@ -654,6 +657,8 @@ def exit_app(do_save):  # Exit Application
             logging.debug(f"Waiting for threads to exit, {active_threads} pending")
             time.sleep(0.2)
 
+    proxy_jpeg_writer.close()  # Finish all proxies already submitted by the save workers.
+
     # Uncomment next two lines when running on RPi
     if not SimulatedRun:
         send_arduino_command(CMD_TERMINATE)  # Tell Arduino we stop (to turn off uv led
@@ -921,6 +926,7 @@ def cmd_settings_popup_dismiss():
 
 
 def cmd_settings_popup_accept():
+    global ProxyJpegEnabled
     global options_dlg
     global ExpertMode, ExperimentalMode, PlotterEnabled, SimplifiedMode, UIScrollbars, DetectMisalignedFrames, MisalignedFrameTolerance, FontSize, DisableToolTips
     global WidgetsEnabledWhileScanning, LoggingMode, LogLevel, ColorCodedButtons, TempInFahrenheit
@@ -932,6 +938,9 @@ def cmd_settings_popup_accept():
 
 
     ConfigData["PopupPos"] = options_dlg.geometry()
+    ProxyJpegEnabled = proxy_jpeg_enabled.get()
+    ConfigData['ProxyJpegEnabled'] = ProxyJpegEnabled
+    logging.info('DNG proxy JPEGs %s (1366x1024, Q90)', 'enabled' if ProxyJpegEnabled else 'disabled')
 
     refresh_ui = False
     if SimplifiedMode != simplified_mode.get():
@@ -1060,6 +1069,7 @@ def cmd_settings_popup_accept():
 
 
 def cmd_settings_popup():
+    global proxy_jpeg_enabled
     global options_dlg, win
     global ExpertMode, ExperimentalMode, PlotterEnabled, UIScrollbars, DetectMisalignedFrames, MisalignedFrameTolerance, FontSize, DisableToolTips
     global WidgetsEnabledWhileScanning, LoggingMode, ColorCodedButtons, TempInFahrenheit
@@ -1202,6 +1212,16 @@ def cmd_settings_popup():
     # file_type_dropdown.config(state=DISABLED)
     as_tooltips.add(file_type_label, "Select format to safe film frames (JPG, PNG, DNG)")
 
+    options_row += 1
+
+    proxy_jpeg_enabled = tk.BooleanVar(value=ProxyJpegEnabled)
+    proxy_jpeg_btn = tk.Checkbutton(options_dlg, text='Save proxy JPEGs with DNG',
+                                   variable=proxy_jpeg_enabled, font=("Arial", FontSize-1),
+                                   name='proxy_jpeg_btn')
+    proxy_jpeg_btn.grid(row=options_row, column=0, columnspan=2, sticky='W', padx=(2*FontSize, 0))
+    as_tooltips.add(proxy_jpeg_btn, 'Save 1366 × 1024 JPEGs at quality 90 in a proxies subfolder. '
+                    'Uses the same exposure and filename as each DNG. RAW resolution is unchanged. '
+                    'Applies only to DNG captures; off by default.')
     options_row += 1
 
     # Base ALT-Scann8 folder
@@ -2043,14 +2063,20 @@ def capture_save_thread(queue, event, id):
         frame_idx = message[2]
         hdr_idx = message[3]
         if is_dng:
-            # Saving DNG/PNG implies passing a request, not an image, therefore no additional checks (no negative allowed)
-            if hdr_idx > 1:  # Hdr frame 1 has standard filename
-                request.save_dng(HdrFrameFilenamePattern % (frame_idx, hdr_idx, FileType))
-            else:  # Non HDR
-                request.save_dng(FrameFilenamePattern % (frame_idx, FileType))                    
-                if DetectMisalignedFrames:
+            filename = (HdrFrameFilenamePattern % (frame_idx, hdr_idx, FileType) if hdr_idx > 1
+                        else FrameFilenamePattern % (frame_idx, FileType))
+            proxy_image = None
+            try:
+                request.save_dng(filename)
+                if len(message) > 4 and message[4]:
+                    proxy_image = capture_proxy_image(request)
+                if DetectMisalignedFrames and hdr_idx <= 1:
                     captured_image = request.make_array('main')
-            request.release()   # Release request ASAP (delay frame alignment check)
+            finally:
+                request.release()
+            # Never retain a camera buffer while resizing, encoding or waiting for a proxy slot.
+            if proxy_image is not None:
+                proxy_jpeg_writer.submit(proxy_image, filename)
             if DetectMisalignedFrames and hdr_idx <= 1:
                 frame_centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
                 if DetectMisalignedFrames and not frame_centered:
@@ -2620,11 +2646,17 @@ def capture_hdr(mode):
                     queue_item = tuple((IMAGE_TOKEN, captured_image, CurrentFrame, idx))
                     capture_display_queue.put(queue_item)
                 curtime = time.time()
-                if idx > 1:  # Hdr frame 1 has standard filename
-                    request.save_dng(HdrFrameFilenamePattern % (CurrentFrame, idx, FileType))
-                else:  # Non HDR
-                    request.save_dng(FrameFilenamePattern % (CurrentFrame, FileType))
-                request.release()
+                filename = (HdrFrameFilenamePattern % (CurrentFrame, idx, FileType) if idx > 1
+                            else FrameFilenamePattern % (CurrentFrame, FileType))
+                proxy_image = None
+                try:
+                    request.save_dng(filename)
+                    if is_dng and ProxyJpegEnabled:
+                        proxy_image = capture_proxy_image(request)
+                finally:
+                    request.release()
+                if proxy_image is not None:
+                    proxy_jpeg_writer.submit(proxy_image, filename, background=not DisableThreads)
                 logging.debug(f"Capture hdr, saved request image ({CurrentFrame}, {idx}: "
                               f"{round((time.time() - curtime) * 1000, 1)}")
             else:
@@ -3305,7 +3337,8 @@ def capture_single(mode):
             else:
                 time_preview_display.add_value(0)
             if mode == 'normal' or mode == 'manual':  # Do not save in preview mode, only display
-                save_queue_item = tuple((REQUEST_TOKEN, request, CurrentFrame, 0))
+                save_queue_item = tuple((REQUEST_TOKEN, request, CurrentFrame, 0,
+                                         is_dng and ProxyJpegEnabled))
                 capture_save_queue.put(save_queue_item)
                 logging.debug(f"Queueing frame ({CurrentFrame}")
         else:
@@ -3334,10 +3367,18 @@ def capture_single(mode):
             else:
                 captured_image = None
             draw_preview_image(captured_image, CurrentFrame, 0)
-            if mode == 'normal' or mode == 'manual':  # Do not save in preview mode, only display
-                request.save_dng(FrameFilenamePattern % (CurrentFrame, FileType))
-                logging.debug(f"Saving DNG frame ({CurrentFrame}: {round((time.time() - curtime) * 1000, 1)}")
-            request.release()
+            proxy_image = None
+            filename = FrameFilenamePattern % (CurrentFrame, FileType)
+            try:
+                if mode == 'normal' or mode == 'manual':  # Do not save in preview mode, only display
+                    request.save_dng(filename)
+                    if is_dng and ProxyJpegEnabled:
+                        proxy_image = capture_proxy_image(request)
+                    logging.debug(f"Saving DNG frame ({CurrentFrame}: {round((time.time() - curtime) * 1000, 1)}")
+            finally:
+                request.release()
+            if proxy_image is not None:
+                proxy_jpeg_writer.submit(proxy_image, filename, background=False)
         else:
             captured_image = take_alignment_image()
             if NegativeImage:
@@ -4674,6 +4715,7 @@ def init_user_count_data():
 
 
 def load_session_data_post_init():
+    global ProxyJpegEnabled
     global CurrentDir
     global CurrentFrame, FramesToGo
     global MinFrameStepsS8, MinFrameStepsR8
@@ -4735,6 +4777,7 @@ def load_session_data_post_init():
             if 'FileType' in ConfigData:
                 FileType = ConfigData["FileType"]
                 logging.debug(f"Retrieved from config: FileType = {FileType} ({ConfigData['FileType']})")
+            ProxyJpegEnabled = bool(ConfigData.get('ProxyJpegEnabled', False))
             if 'CurrentDir' in ConfigData:
                 CurrentDir = ConfigData["CurrentDir"]
                 if CurrentDir != '':    # Respect empty currentdir in case not yet set after very first run
