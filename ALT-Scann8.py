@@ -115,6 +115,8 @@ from frame_alignment import AlignmentGuard, ForwardRecovery, HoleMeasurement, me
 from alignment_feedback import FineTuner, AlignmentStatistics
 from alignment_statistics_view import AlignmentStatisticsWindow
 from proxy_jpeg import ProxyJpegWriter, capture_proxy_image
+from ntfy_notifications import NtfyNotifier
+from ntfy_settings import NtfySettingsWindow
 from sprocket_yolo import YoloWorker
 
 #  ######### Global variable definition ##########
@@ -317,6 +319,7 @@ CaptureResolution = '2028x1520'
 FileType = 'jpg'
 ProxyJpegEnabled = False
 proxy_jpeg_writer = ProxyJpegWriter()
+ntfy_notifier = None
 # Other options (experimental, expert...)
 PreviewModuleValue = 1
 NegativeImage = False
@@ -622,6 +625,7 @@ def exit_app(do_save):  # Exit Application
     global win
     global ExitingApp
     global hw_panel, hw_panel_installed
+    ntfy_notifier.close()
 
     if alignment_statistics.started is not None and alignment_statistics.stopped is None:
         if alignment_recovery is not None:
@@ -1245,6 +1249,12 @@ def cmd_settings_popup():
     debug_level_dropdown.grid(row=options_row, column=1, sticky='W')
     as_tooltips.add(debug_level_label, "Select logging level, for troubleshooting. Use DEBUG when reporting an issue in Github.")
 
+    options_row += 1
+
+    tk.Button(options_dlg, text='Phone notifications…',
+              command=lambda: NtfySettingsWindow(options_dlg, ntfy_notifier),
+              font=("Arial", FontSize-1), name='notifications_btn').grid(
+                  row=options_row, column=0, columnspan=2, sticky='w', padx=(2*FontSize, 0), pady=4)
     options_row += 1
 
     options_cancel_btn = tk.Button(options_dlg, text="Cancel", command=cmd_settings_popup_dismiss, width=8,
@@ -2850,6 +2860,7 @@ def save_alignment_frame(continue_scan=False, recover=False):
         session_frames -= 1
         ConfigData['CurrentFrame'] = str(CurrentFrame)
         logging.exception('Failed to capture held frame %s', CurrentFrame + 1)
+        notify_scan_problem('save_failed', CurrentFrame + 1, str(error))
         set_alignment_status(f'Capture failed; film still held: {error}')
         tk.messagebox.showerror('Capture failed',
                                 'The film is still held. Check the output files before retrying.\n'
@@ -2898,6 +2909,7 @@ def pause_alignment_frame(reason, image=None):
     global alignment_paused, alignment_pause_dialog
     release_alignment_request()
     alignment_paused = True
+    notify_scan_problem('guard_pause', CurrentFrame + 1, f'Frame not saved; scanning paused. {reason}')
     record = alignment_statistics.frame(CurrentFrame + 1, time.monotonic())
     record.paused = True
     if record.arrival == 'unmeasured':
@@ -3169,6 +3181,8 @@ def pause_alignment_recovery(reason):
     recovery_pending = None
     release_alignment_request()
     alignment_paused = True
+    notify_scan_problem('recovery_failed', CurrentFrame + 1,
+                        f'Frame {CurrentFrame} saved as-is; next frame not saved. {reason}')
     alignment_statistics.frame(CurrentFrame + 1, time.monotonic()).recovery_failed = True
     logging.warning('Recovery stopped after frame=%i total_steps=%i: %s',
                     CurrentFrame, alignment_recovery.total_steps, reason)
@@ -5295,6 +5309,7 @@ def create_main_window():
     else:
         destroy_widgets(win)
         win.deiconify()
+    win.report_callback_exception = exception_hook
     if SimulatedRun:
         if SimulatedArduinoVersion == None:
             win.title(f'ALT-Scann8 v{__version__} ***  SIMULATED RUN, NOT OPERATIONAL ***')
@@ -5345,11 +5360,30 @@ def create_main_window():
 
 
 # Define a custom exception hook to log uncaught exceptions
+def notify_scan_problem(kind, frame, reason):
+    try:
+        ntfy_notifier.notify(kind, frame, reason, folder=CurrentDir, run_id=alignment_statistics.run_id)
+    except Exception:
+        logging.warning('Could not queue scanner notification')
+
+
+def notify_save_exception(error, tb):
+    # Read the actual failed worker frame, not the capture loop's newer counter.
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name in ('capture_save_thread', 'capture_single', 'capture_hdr'):
+            frame = tb.tb_frame.f_locals.get('frame_idx', CurrentFrame)
+            notify_scan_problem('save_failed', frame, f'Could not save frame. {error}')
+            return
+        tb = tb.tb_next
+
+
 def exception_hook(exctype, value, tb):
+    notify_save_exception(value, tb)
     logging.exception(f"Uncaught exception {repr(value)}", exc_info=(exctype, value, tb))
 
 
 def log_thread_exception(args):
+    notify_save_exception(args.exc_value, args.exc_traceback)
     logging.exception(f"Thread exception occurred: {args.exc_type.__name__}: {args.exc_value}", exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
 
 
@@ -7683,6 +7717,7 @@ def report_usage():
 
 
 def main(argv):
+    global ntfy_notifier
     global SimulatedRun, SimulatedArduinoVersion
     global ExpertMode, ExperimentalMode, PlotterEnabled
     global LogLevel, LoggingMode
@@ -7755,6 +7790,7 @@ def main(argv):
         raise ValueError('Invalid log level: %s' % LogLevel)
     else:
         init_logging()
+    ntfy_notifier = NtfyNotifier(os.path.join(ScriptDir, 'ntfy.json'))
 
     ALT_scann_init_done = False
 

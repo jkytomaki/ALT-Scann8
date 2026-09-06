@@ -1,4 +1,6 @@
 # Byte-compiled / optimized / DLL files
+ntfy.json
+.ntfy-*
 __pycache__/
 *.py[cod]
 *$py.class
