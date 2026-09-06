@@ -112,7 +112,8 @@ from dynamic_spinbox import DynamicSpinbox
 from tooltip import Tooltips
 from rolling_average import RollingAverage
 from frame_alignment import AlignmentGuard, ForwardRecovery, HoleMeasurement, measure_hole
-from alignment_feedback import FineTuner, AlignmentStatistics, format_statistics
+from alignment_feedback import FineTuner, AlignmentStatistics
+from alignment_statistics_view import AlignmentStatisticsWindow
 from sprocket_yolo import YoloWorker
 
 #  ######### Global variable definition ##########
@@ -364,7 +365,6 @@ alignment_status_var = None
 fine_tuner = FineTuner()
 alignment_statistics = AlignmentStatistics()
 alignment_stats_button_var = None
-alignment_stats_details_var = None
 alignment_stats_window = None
 alignment_stats_last_log = 0
 alignment_stats_logged_captures = 0
@@ -2672,20 +2672,11 @@ def set_alignment_status(message):
 
 
 def show_alignment_statistics():
-    global alignment_stats_window, alignment_stats_details_var
+    global alignment_stats_window
     if alignment_stats_window is not None and alignment_stats_window.winfo_exists():
         alignment_stats_window.lift()
         return
-    alignment_stats_window = tk.Toplevel(win)
-    alignment_stats_window.title('Alignment statistics')
-    alignment_stats_details_var = tk.StringVar()
-    tk.Label(alignment_stats_window, textvariable=alignment_stats_details_var,
-             justify=LEFT, anchor='w', font=('TkFixedFont', 12), padx=16, pady=12).pack()
-    tk.Label(alignment_stats_window, text=(
-        'Offsets describe the original stop, before corrections. Positive = undershoot.\n'
-        'Unknown and unmeasured arrivals are not counted as aligned.\n'
-        'Effective speed includes pauses and recovery. Captured images may still be saving.'),
-        justify=LEFT, padx=16, pady=8).pack()
+    alignment_stats_window = AlignmentStatisticsWindow(win)
     refresh_alignment_statistics()
 
 
@@ -2701,11 +2692,11 @@ def refresh_alignment_statistics(force_log=False, reason='periodic'):
         fps = '—' if current['effective_fps'] is None else f"{current['effective_fps']:.2f}"
         alignment_stats_button_var.set(f"Aligned {aligned} · corrected {current['corrections']}\n"
                                        f"{fps} fps · Alignment statistics…")
-    if alignment_stats_details_var is not None:
-        alignment_stats_details_var.set(format_statistics(snapshot) + '\n\n' + tuning
-            + f'\nGuard {AlignmentGuardMode}, tolerance {AlignmentGuardTolerance:g}%'
-            + f'\nPT {"Auto" if AutoPtLevelEnabled else "Manual"}, Fine Tune {FrameFineTuneValue}'
-            + f'\nSteps {StepsPerFrame} ({"Auto" if AutoFrameStepsEnabled else "Manual"})')
+    if alignment_stats_window is not None and alignment_stats_window.winfo_exists():
+        alignment_stats_window.update_snapshot(snapshot, tuning,
+            f'Guard: {AlignmentGuardMode} · Tolerance: {AlignmentGuardTolerance:g}%'
+            + f' · PT: {"Auto" if AutoPtLevelEnabled else "Manual"} · Fine Tune: {FrameFineTuneValue}'
+            + f'\nSteps: {StepsPerFrame} ({"Auto" if AutoFrameStepsEnabled else "Manual"})')
     captured = snapshot['session']['captured']
     if alignment_statistics.started is not None and (force_log or (
             snapshot['active'] and (now - alignment_stats_last_log >= 30

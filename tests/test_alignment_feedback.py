@@ -195,8 +195,8 @@ class StatisticsTests(unittest.TestCase):
         stats.start(10)
         ns = base.scanner_functions('refresh_alignment_statistics', alignment_statistics=stats,
             alignment_stats_last_log=10, alignment_stats_logged_captures=0,
-            alignment_stats_button_var=Mock(), alignment_stats_details_var=Mock(),
-            format_statistics=format_statistics, AlignmentGuardMode='Correct', AlignmentGuardTolerance=3,
+            alignment_stats_button_var=Mock(), alignment_stats_window=Mock(),
+            AlignmentGuardMode='Correct', AlignmentGuardTolerance=3,
             AutoPtLevelEnabled=True, FrameFineTuneValue=25, StepsPerFrame=250, AutoFrameStepsEnabled=False,
             alignment_settings=Mock(return_value={'fine_tune': 25}),
             logging=Mock(), time=Mock(monotonic=Mock(return_value=39)))
@@ -206,7 +206,9 @@ class StatisticsTests(unittest.TestCase):
         ns['refresh_alignment_statistics']()
         logged = json.loads(ns['logging'].info.call_args.args[1])
         self.assertEqual(logged['session']['elapsed_s'], 30)
-        self.assertIn(format_statistics(logged), ns['alignment_stats_details_var'].set.call_args.args[0])
+        shown = ns['alignment_stats_window'].update_snapshot.call_args.args[0]
+        self.assertEqual(logged['recent'], shown['recent'])
+        self.assertEqual(logged['session'], shown['session'])
         stats.stop(42)
         ns['refresh_alignment_statistics'](True, 'stop')
         self.assertEqual(json.loads(ns['logging'].info.call_args.args[1])['reason'], 'stop')

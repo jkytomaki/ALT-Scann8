@@ -41,6 +41,9 @@ unmeasured arrivals, median signed offset, 95th-percentile absolute error,
 correction frames/nudges/acknowledged steps, pauses, recovery attempts/results/steps,
 saved-as-is overrides, captures and effective frames/sec. It also shows tuner status
 and the current guard tolerance, PT, Fine Tune and step settings.
+The table groups alignment, corrections/recovery, and throughput, with fixed
+numeric columns and the position count for each scope. The header shows scan state,
+frame range and elapsed time; Auto Fine Tune status appears in its own panel.
 
 Statistics use original PT-stop positions. Clean guard checks use the usual
 multi-strip evidence; suspect positions and sampled tuning positions require two
