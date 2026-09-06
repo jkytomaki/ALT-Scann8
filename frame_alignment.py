@@ -106,6 +106,7 @@ class AlignmentGuard:
         self.arrival_first = None
         self.arrival_recorded = False
         self.arrival_waiting = False
+        self.diagnostic_first = None
 
     def inspect(self, measurement):
         offset, height = measurement.offset, measurement.height

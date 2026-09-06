@@ -18,7 +18,7 @@ class FineTuner:
         self.last_time = None
         self.wait_until = 0
         self.last_direction = 0
-        self.status = 'Waiting for verified samples'
+        self.status = 'Waiting for alignment samples'
 
     def skip(self, reason):
         self.samples.clear()
@@ -45,7 +45,7 @@ class FineTuner:
             return None
         self.samples.append(offset_pct)
         if len(self.samples) < 8:
-            self.status = f'Verified samples: {len(self.samples)}/8'
+            self.status = f'Alignment samples: {len(self.samples)}/8'
             return None
         bias = median(self.samples)
         direction = 1 if bias > 0 else -1
@@ -83,6 +83,7 @@ class FrameRecord:
     offset_pct: float | None = None
     arrival: str = 'unmeasured'
     confirmed: bool = False
+    diagnostic: dict | None = None
     source: str = ''
     tolerance_pct: float = 0
     nudges: int = 0
@@ -140,6 +141,8 @@ class AlignmentStatistics:
         pt = [r for r in records if r.origin == 'pt']
         offsets = [r.offset_pct for r in pt if r.offset_pct is not None]
         absolute = sorted(abs(x) for x in offsets)
+        pairs = [r.diagnostic for r in pt if r.diagnostic is not None]
+        deltas = [abs(p['delta_pct']) for p in pairs if p['delta_pct'] is not None]
         count = lambda name: sum(r.arrival == name for r in pt)
         captured = sum(r.captured_at is not None for r in records)
         return dict(positions=len(records), pt_arrivals=len(pt), captured=captured,
@@ -147,6 +150,10 @@ class AlignmentStatistics:
                 if pt and any(r.arrival != 'unmeasured' for r in pt) else None,
             undershoots=count('undershoot'), overshoots=count('overshoot'), unknown=count('unknown'),
             unmeasured=count('unmeasured'), confirmed=sum(r.confirmed for r in pt),
+            diagnostic_pairs=len(pairs),
+            diagnostic_disagreements=sum(p['agrees'] is False for p in pairs),
+            diagnostic_unknown=sum(p['agrees'] is None for p in pairs),
+            diagnostic_median_delta_pct=median(deltas) if deltas else None,
             median_offset_pct=median(offsets) if offsets else None,
             p95_absolute_pct=absolute[math.ceil(len(absolute) * .95) - 1] if absolute else None,
             corrections=sum(r.nudges > 0 for r in records), nudges=sum(r.nudges for r in records),
