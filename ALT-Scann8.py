@@ -20,9 +20,9 @@ __copyright__ = "Copyright 2022-25, Juan Remirez de Esparza"
 __credits__ = ["Juan Remirez de Esparza"]
 __license__ = "MIT"
 __module__ = "ALT-Scann8"
-__version__ = "1.20.09"
-__date__ = "2025-11-13"
-__version_highlight__ = "Some bugfixes, UI"
+__version__ = "1.20.12"
+__date__ = "2026-09-05"
+__version_highlight__ = "Fix issue when setting frame VCenter"
 __maintainer__ = "Juan Remirez de Esparza"
 __email__ = "jremirez@hotmail.com"
 __status__ = "Development"
@@ -1917,6 +1917,10 @@ def check_arrival_feedback(measurement, decision, attempts_before):
 
 
 def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice_width=10):
+    # Make sure img is a Numpy array
+    if not isinstance(img, np.ndarray):
+        img = np.array(img)
+
     # Get dimensions of the binary image
     height = img.shape[0]
     width = img.shape[1]
