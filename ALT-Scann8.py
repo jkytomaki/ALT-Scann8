@@ -1848,12 +1848,12 @@ def alignment_settings():
 
 
 def adjust_auto_fine_tune(measurement, confirmed, source):
-    """Only original, confirmed PT stops can adjust the single threshold tuner."""
+    """Only reliable original PT stops can adjust the threshold tuner."""
     global FrameFineTuneValue, PreviousFrameFineTuneValue, auto_fine_tune_limit_warned
     unavailable = fine_tune_availability()
     record = alignment_statistics.records.get(CurrentFrame + 1)
     reason = unavailable
-    if not reason and (not confirmed or measurement.offset is None or source == 'yolo'):
+    if not reason and (measurement.offset is None or source == 'yolo'):
         reason = 'Skipped unverified alignment'
     if not reason and (record is None or record.origin != 'pt' or 'reported_steps' not in record.settings):
         reason = 'Skipped stop without PT telemetry'
@@ -1896,12 +1896,12 @@ def record_alignment_arrival(measurement, confirmed=False, source=None):
     added = alignment_statistics.arrival(CurrentFrame + 1, time.monotonic(),
         None if measurement.offset is None else 100 * measurement.offset / measurement.height,
         AlignmentGuardTolerance, confirmed, source)
-    if added and (confirmed or measurement.offset is None):
+    if added:
         adjust_auto_fine_tune(measurement, confirmed, source)
 
 
 def check_arrival_feedback(measurement, decision, attempts_before):
-    """Return True only when an extra stationary tuning sample is needed."""
+    """Feed each original stop; request occasional diagnostic exposures separately."""
     if attempts_before or alignment_guard.arrival_recorded:
         return False
     first = alignment_guard.arrival_first
@@ -1909,9 +1909,14 @@ def check_arrival_feedback(measurement, decision, attempts_before):
         alignment_guard.arrival_first = measurement
         sample = (fine_tune_availability() is None and (CurrentFrame + 1) % 5 == 0
                   and measurement.offset is not None and measurement.source != 'yolo')
-        if decision == 'confirm' or (decision == 'accept' and sample):
+        if decision == 'confirm':
             alignment_guard.arrival_waiting = True
-            return decision != 'confirm'
+            return False
+        if decision == 'accept' and sample:
+            record_alignment_arrival(measurement)
+            alignment_guard.arrival_recorded = True
+            alignment_guard.diagnostic_first = measurement
+            return True
         record_alignment_arrival(measurement)
     else:
         confirmed = (first.offset is not None and measurement.offset is not None
@@ -1924,6 +1929,36 @@ def check_arrival_feedback(measurement, decision, attempts_before):
     alignment_guard.arrival_recorded = True
     alignment_guard.arrival_waiting = False
     return False
+
+
+def finish_alignment_diagnostic(measurement=None, metadata=None, error=None):
+    """Log repeatability without changing tuning, motion or the accepted exposure."""
+    global alignment_guard
+    first = alignment_guard.diagnostic_first
+    first_metadata = alignment_request.get_metadata()
+    comparable = (measurement is not None and first.offset is not None
+                  and measurement.offset is not None and first.height == measurement.height)
+    delta = measurement.offset - first.offset if comparable else None
+    delta_pct = 100 * delta / first.height if comparable else None
+    pair = dict(frame=CurrentFrame + 1, run_id=alignment_statistics.run_id,
+                interval_frames=5, first_offset_px=first.offset,
+                second_offset_px=measurement.offset if measurement else None,
+                delta_px=delta, delta_pct=delta_pct,
+                agrees=abs(delta_pct) <= 1.5 if comparable else None,
+                first_source=first.source, second_source=measurement.source if measurement else None,
+                first_height=first.height, second_height=measurement.height if measurement else None,
+                first_sensor_timestamp_ns=first_metadata.get('SensorTimestamp'),
+                second_sensor_timestamp_ns=(metadata or {}).get('SensorTimestamp'),
+                first_exposure_us=first_metadata.get('ExposureTime'),
+                second_exposure_us=(metadata or {}).get('ExposureTime'),
+                reason=error or (measurement.reason if measurement else 'Diagnostic unavailable'))
+    record = alignment_statistics.frame(CurrentFrame + 1, time.monotonic())
+    record.diagnostic = pair
+    record.confirmed = record.confirmed or pair['agrees'] is True
+    logging.info('Alignment diagnostic pair %s', json.dumps(pair, sort_keys=True))
+    alignment_guard = None
+    set_alignment_status('Diagnostic recorded; saving original exposure')
+    return True
 
 
 def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice_width=10):
@@ -2995,7 +3030,7 @@ def prepare_alignment_frame():
     global alignment_last_measurement
     if SimulatedRun or CameraDisabled:
         return True
-    if AlignmentGuardMode == 'Off' and fine_tune_availability() is not None:
+    if alignment_guard is None and AlignmentGuardMode == 'Off' and fine_tune_availability() is not None:
         return True
     if alignment_guard is None:
         alignment_guard = AlignmentGuard(AlignmentGuardTolerance,
@@ -3036,13 +3071,16 @@ def prepare_alignment_frame():
             metadata = request.get_metadata()
             exposure_start = (metadata['SensorTimestamp'] - metadata['ExposureTime'] * 1000) / 1e9
             if exposure_start < CaptureSettleDeadline:
+                if alignment_guard.diagnostic_first is not None:
+                    return finish_alignment_diagnostic(error='Camera did not provide a settled diagnostic exposure')
                 pause_alignment_frame('Camera did not provide a settled exposure')
                 return False
             image = request.make_array('main')
             height = image.shape[0]
             shift = FrameVCenterImageShift * height / PreviewHeight if PreviewHeight > 0 else FrameVCenterImageShift
             measurement = measure_hole(image, FilmType, shift)
-            if measurement.offset is None and AlignmentGuardMode != 'Off':
+            if (measurement.offset is None and AlignmentGuardMode != 'Off'
+                    and alignment_guard.diagnostic_first is None):
                 logging.info('Alignment fallback frame=%i source=%s reason=%s',
                              CurrentFrame + 1, measurement.source, measurement.reason)
                 # PIL normalizes the camera stream format to RGB. Inference
@@ -3056,6 +3094,8 @@ def prepare_alignment_frame():
                 request = None
                 set_alignment_status(f'Checking damaged sprocket on frame {CurrentFrame + 1}')
                 return False
+        if alignment_guard.diagnostic_first is not None:
+            return finish_alignment_diagnostic(measurement, request.get_metadata())
         stage = ('after_nudge' if alignment_guard.attempts else
                  'confirmation' if alignment_guard.confirming or alignment_guard.arrival_waiting else 'initial')
         alignment_last_measurement = measurement
@@ -3080,7 +3120,9 @@ def prepare_alignment_frame():
         decision = 'accept' if AlignmentGuardMode == 'Off' else alignment_guard.inspect(measurement)
         if check_arrival_feedback(measurement, decision, attempts_before):
             CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME)
-            set_alignment_status('Verifying Fine Tune sample')
+            alignment_request = request
+            request = None  # Save this accepted exposure after the diagnostic completes.
+            set_alignment_status('Sampling exposure repeatability')
             return False
         if decision in ('confirm', 'nudge') or alignment_guard.attempts:
             # Show the checked position before movement and after every nudge,
@@ -3127,6 +3169,8 @@ def prepare_alignment_frame():
         pause_alignment_frame(reason, request.make_image('main'))
         return False
     except (RuntimeError, KeyError, ValueError, cv2.error) as error:
+        if alignment_guard is not None and alignment_guard.diagnostic_first is not None:
+            return finish_alignment_diagnostic(error=str(error))
         logging.exception('Cannot verify stationary frame')
         pause_alignment_frame(f'Could not verify frame: {error}')
         return False
@@ -7260,7 +7304,7 @@ def create_widgets():
         if ColorCodedButtons:
             fine_tune_btn.config(selectcolor="pale green")
         fine_tune_btn.grid(row=frame_align_row, column=0, columnspan=2, sticky="EW")
-        as_tooltips.add(fine_tune_btn, "Use confirmed camera samples to adjust Fine Tune slowly. Requires PT Level Auto. Works with the alignment guard Off, Pause or Correct; inactive in Visual Detection.")
+        as_tooltips.add(fine_tune_btn, "Use reliable original-stop measurements to adjust Fine Tune. Requires PT Level Auto. Works with the alignment guard Off, Pause or Correct; inactive in Visual Detection.")
 
         frame_fine_tune_value = tk.IntVar(value=FrameFineTuneValue)  # To be overridden by config
         frame_fine_tune_spinbox = DynamicSpinbox(frame_alignment_frame, command=cmd_frame_fine_tune_selection, width=4,

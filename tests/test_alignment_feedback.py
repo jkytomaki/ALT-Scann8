@@ -66,25 +66,33 @@ class ArrivalTests(unittest.TestCase):
     def test_guard_off_collects_pair_without_pausing_or_nudging(self):
         ns, requests = self.preflight([HoleMeasurement(20, 1000), HoleMeasurement(22, 1000)])
         self.assertFalse(ns['prepare_alignment_frame']())
-        ns['adjust_auto_fine_tune'].assert_not_called()
+        ns['adjust_auto_fine_tune'].assert_called_once()
         self.assertTrue(ns['prepare_alignment_frame']())
         ns['pause_alignment_frame'].assert_not_called()
         ns['send_alignment_nudge'].assert_not_called()
         sample, confirmed, source = ns['adjust_auto_fine_tune'].call_args.args
-        self.assertTrue(confirmed)
-        self.assertEqual(sample.offset, 21)
-        requests[0].release.assert_called_once()
-        self.assertIs(ns['alignment_request'], requests[1])
+        self.assertFalse(confirmed)
+        self.assertEqual(sample.offset, 20)
+        ns['adjust_auto_fine_tune'].assert_called_once()
+        self.assertEqual(ns['alignment_statistics'].records[45].diagnostic['delta_px'], 2)
+        self.assertTrue(ns['alignment_statistics'].records[45].diagnostic['agrees'])
+        requests[1].release.assert_called_once()
+        self.assertIs(ns['alignment_request'], requests[0])
+        requests[0].release.assert_not_called()
 
-    def test_guard_off_disagreement_skips_tuning_without_pausing(self):
+    def test_diagnostic_disagreement_is_logged_without_changing_tuning_or_capture(self):
         ns, _ = self.preflight([HoleMeasurement(20, 1000), HoleMeasurement(200, 1000)])
         ns['prepare_alignment_frame']()
         self.assertTrue(ns['prepare_alignment_frame']())
         ns['pause_alignment_frame'].assert_not_called()
         sample, confirmed, _ = ns['adjust_auto_fine_tune'].call_args.args
-        self.assertIsNone(sample.offset)
+        self.assertEqual(sample.offset, 20)
         self.assertFalse(confirmed)
-        self.assertEqual(ns['alignment_statistics'].records[45].arrival, 'unknown')
+        ns['adjust_auto_fine_tune'].assert_called_once()
+        record = ns['alignment_statistics'].records[45]
+        self.assertEqual(record.arrival, 'aligned')
+        self.assertEqual(record.diagnostic['delta_pct'], 18)
+        self.assertFalse(record.diagnostic['agrees'])
 
     def test_original_offset_is_recorded_once_before_correction_not_after(self):
         ns, _ = self.preflight([HoleMeasurement(200, 1000), HoleMeasurement(202, 1000), HoleMeasurement(10, 1000)], 'Correct')
@@ -100,7 +108,65 @@ class ArrivalTests(unittest.TestCase):
         ns, _ = self.preflight([HoleMeasurement(20, 1000)], frame=45)
         self.assertTrue(ns['prepare_alignment_frame']())
         ns['capture_settled_request'].assert_called_once()
-        ns['adjust_auto_fine_tune'].assert_not_called()
+        ns['adjust_auto_fine_tune'].assert_called_once()
+
+    def test_diagnostic_does_not_invoke_guard_or_yolo_on_second_exposure(self):
+        ns, requests = self.preflight([HoleMeasurement(20, 1000), HoleMeasurement(None, 1000)], 'Correct')
+        self.assertFalse(ns['prepare_alignment_frame']())
+        self.assertTrue(ns['prepare_alignment_frame']())
+        ns['pause_alignment_frame'].assert_not_called()
+        ns['send_alignment_nudge'].assert_not_called()
+        ns['alignment_yolo_worker'].submit.assert_not_called()
+        self.assertIsNone(ns['alignment_statistics'].records[45].diagnostic['agrees'])
+        self.assertIs(ns['alignment_request'], requests[0])
+        requests[1].release.assert_called_once()
+
+    def test_failed_or_stale_diagnostic_preserves_original_accepted_request(self):
+        for failure in ('camera', 'stale'):
+            ns, requests = self.preflight([HoleMeasurement(20, 1000)] * 2, 'Correct')
+            ns['prepare_alignment_frame']()
+            if failure == 'camera':
+                ns['capture_settled_request'].side_effect = RuntimeError('Camera test failure')
+            else:
+                requests[1].get_metadata.return_value['SensorTimestamp'] = 0
+            self.assertTrue(ns['prepare_alignment_frame']())
+            ns['pause_alignment_frame'].assert_not_called()
+            self.assertIs(ns['alignment_request'], requests[0])
+            self.assertIsNone(ns['alignment_statistics'].records[45].diagnostic['agrees'])
+            requests[0].release.assert_not_called()
+
+    def test_stop_during_diagnostic_releases_held_original(self):
+        ns, requests = self.preflight([HoleMeasurement(20, 1000)] * 2, 'Correct')
+        ns['prepare_alignment_frame']()
+        reset = base.scanner_functions('reset_alignment_guard', 'release_alignment_request',
+            alignment_guard=ns['alignment_guard'], alignment_request=ns['alignment_request'],
+            alignment_yolo_pending=None, alignment_pause_dialog=None)
+        reset['reset_alignment_guard']()
+        requests[0].release.assert_called_once()
+        self.assertIsNone(reset['alignment_guard'])
+        self.assertIsNone(reset['alignment_request'])
+
+    def test_diagnostic_summary_separates_small_large_and_unknown_differences(self):
+        stats = AlignmentStatistics()
+        stats.start(0)
+        for frame, delta in enumerate((.2, 2.5, None), 1):
+            record = stats.frame(frame, frame, origin='pt')
+            record.diagnostic = dict(delta_pct=delta, agrees=None if delta is None else abs(delta) <= 1.5)
+        summary = stats.snapshot(4)['session']
+        self.assertEqual(summary['diagnostic_pairs'], 3)
+        self.assertEqual(summary['diagnostic_disagreements'], 1)
+        self.assertEqual(summary['diagnostic_unknown'], 1)
+        self.assertAlmostEqual(summary['diagnostic_median_delta_pct'], 1.35)
+
+    def test_every_frame_feedback_reaches_tuner_without_double_exposure_requirement(self):
+        ns = base.FineTuneTests().state()
+        for frame in range(1, 14):
+            ns['CurrentFrame'] = frame - 1
+            ns['alignment_statistics'].frame(frame, frame, origin='pt', settings=dict(
+                reported_steps=280, pt_valid=True, steps=250, extra_steps=0, film='S8',
+                steps_auto=False, speed=5, vcenter=0, resolution='4056x3040', capstan=14.6))
+            ns['adjust_auto_fine_tune'](HoleMeasurement(30, 1000), False, 'strips')
+        ns['send_arduino_command'].assert_called_once_with(54, 26)
 
     def test_retry_does_not_feed_same_frame_again(self):
         ns, _ = self.preflight([HoleMeasurement(200, 1000)] * 4, 'Pause')

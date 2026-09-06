@@ -1,6 +1,6 @@
 """Live alignment statistics window; reads snapshots without touching the scanner."""
 import tkinter as tk
-from tkinter import font, ttk
+from tkinter import font
 
 
 class AlignmentStatisticsWindow(tk.Toplevel):
@@ -97,10 +97,15 @@ class AlignmentStatisticsWindow(tk.Toplevel):
             'Unknown and unmeasured stops count against the aligned percentage.\n'
             'Speed includes pauses and recovery; captured frames may still be saving.'),
             font=self.small_font, background='#f3f5f7', wraplength=570).pack(side='left')
-        ttk.Button(footer, text='Close', command=self.destroy).pack(side='right', padx=(12, 0))
-        self.bind('<Escape>', lambda _event: self.destroy())
+        self.close_button = tk.Button(footer, text='Close', command=self.close, padx=12)
+        self.close_button.pack(side='right', padx=(12, 0))
+        self.protocol('WM_DELETE_WINDOW', self.close)
+        self.bind('<Escape>', self.close)
         self.update_idletasks()
         self.minsize(self.winfo_reqwidth(), self.winfo_reqheight())
+
+    def close(self, _event=None):
+        self.destroy()
 
     def label(self, parent, **options):
         options.setdefault('font', self.body_font)

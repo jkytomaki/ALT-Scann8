@@ -4,9 +4,9 @@ Branch: `frame-alignment-fixes`, based on the Pi's deployed `651f5d8`.
 
 ## Behavior
 
-### Verified Auto Fine Tune
+### Auto Fine Tune feedback
 
-There is one Auto Fine Tune algorithm. It now uses confirmed camera feedback
+There is one Auto Fine Tune algorithm. It now uses reliable original-stop camera feedback
 instead of the old five-sample average and up-to-ten-point jumps. The controls
 are independent: with **PT Level Auto** on and **Visual Detection** off, Auto Fine
 Tune can operate with the guard **Off**, **Pause** or **Correct**. Guard Off still
@@ -14,16 +14,31 @@ means no framing pauses or corrective nudges; uncertain tuning samples are ignor
 Manual PT and Visual Detection make the tuner inactive, with the reason displayed
 in Alignment statistics. The manual Fine Tune value remains available as before.
 
-Every fifth clean frame is sampled with two fresh, settled exposures. Suspect
-frames reuse the guard's existing confirmation. Pairs must agree within 1.5% of
-image height, and feedback is recorded once from the original stop, before any
-nudge. Single-exposure checks, YOLO results, uncertain/extreme offsets (over 25%),
-invalid PT readings, missing stop telemetry, and stops within two steps of the
-minimum detection gate do not adjust the tuner. Recovery does not feed it.
+Each reliable original PT stop feeds Auto Fine Tune, including single-exposure
+measurements. Suspect frames still use the guard's required confirmation before
+feeding it. Feedback is recorded once per numbered frame, before any nudge.
+YOLO results, uncertain/extreme offsets (over 25%), invalid PT readings, missing
+stop telemetry, and stops within two steps of the minimum detection gate do not
+adjust the tuner. Recovery does not feed it.
 
-After five frames of settings warmup, at least eight verified samples and a
+Every fifth clean frame also gets a second settled exposure as a diagnostic while
+Auto Fine Tune is available. It neither changes the first measurement used for
+tuning nor replaces the original exposure held for saving. Differences, unknown
+positions or camera errors in this optional diagnostic are logged, without causing
+extra correction or a guard pause. Required guard confirmations remain separate.
+`Alignment diagnostic pair` JSON records both offsets and their signed difference
+in pixels and percent of image height, sources, exposure times, sensor timestamps,
+frame and run ID. `agrees` means within 1.5% of image height; null means comparison
+was unavailable. All numeric differences are retained, including smaller ones.
+The statistics snapshots include diagnostic pair counts, disagreements, unavailable
+comparisons and median absolute difference, for the last 100 and the session.
+The extra exposure is not saved as another frame file.
+
+After five frames of settings warmup, at least eight reliable samples and a
 75% majority outside a 1% deadband are required. A change is exactly one Fine Tune
 point, bounded to 5–95. It then waits 20 frames and collects fresh evidence.
+With eligible samples on every frame, sustained bias can cause the next one-point
+change 27 frames later; the diagnostic sampling interval does not limit tuning.
 Reversing direction needs 16 samples and a 1.5% deadband. Configuration changes,
 recovery, long sampling gaps and pauses over 60 seconds discard stale evidence.
 Failed sends retain the displayed/saved value and wait before collecting more
@@ -46,9 +61,11 @@ numeric columns and the position count for each scope. The header shows scan sta
 frame range and elapsed time; Auto Fine Tune status appears in its own panel.
 
 Statistics use original PT-stop positions. Clean guard checks use the usual
-multi-strip evidence; suspect positions and sampled tuning positions require two
-exposures. The separate confirmation count identifies those pairs. Disagreeing
-pairs are unknown, rather than silently replaced by a later corrected position.
+multi-strip evidence; suspect positions require guard confirmation. Sampled
+diagnostic positions get a second exposure for repeatability data. The confirmation
+count identifies pairs that agree. Disagreeing required guard confirmations are
+unknown; optional diagnostics preserve the original arrival and record the
+disagreement separately. Later corrected positions never replace original arrivals.
 Unknown and unmeasured arrivals remain in the PT-arrival denominator. If nothing
 has been measured, the aligned percentage is unavailable. With guard Off and
 Auto Fine Tune inactive, no extra camera checks run and arrivals remain unmeasured.

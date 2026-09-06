@@ -266,7 +266,7 @@ class PreflightTests(unittest.TestCase):
             requests.append(request)
         average = RollingAverage(5)
         ns = scanner_functions('prepare_alignment_frame', 'take_alignment_request',
-            'check_arrival_feedback', 'record_alignment_arrival',
+            'check_arrival_feedback', 'record_alignment_arrival', 'finish_alignment_diagnostic',
             alignment_guard=None, alignment_request=None, alignment_yolo_pending=None,
             alignment_yolo_worker=Mock(), HoleMeasurement=HoleMeasurement,
             SimulatedRun=False, CameraDisabled=False,
@@ -281,10 +281,10 @@ class PreflightTests(unittest.TestCase):
             set_alignment_status=Mock(), pause_alignment_frame=Mock(), draw_preview_image=Mock())
         return ns, requests
 
-    def test_single_exposure_reused_without_unconfirmed_tuning(self):
+    def test_single_exposure_reused_and_supplies_tuning_feedback(self):
         ns, requests = self.preflight([HoleMeasurement(20, 1000)], mode='Off')
         self.assertTrue(ns['prepare_alignment_frame']())
-        ns['adjust_auto_fine_tune'].assert_not_called()
+        ns['adjust_auto_fine_tune'].assert_called_once()
         self.assertIsNone(ns['offset_image'].get_average())
         self.assertIs(ns['take_alignment_request'](), requests[0])
         self.assertIsNone(ns['alignment_request'])
