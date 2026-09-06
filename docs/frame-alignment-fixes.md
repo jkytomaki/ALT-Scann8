@@ -40,6 +40,45 @@ Normal save workers finish writing queued exposures after stopping.
 Stop without saving leaves this frame unsaved; a normal scan start requests a new
 film frame. Guard events include its intended filename in the scan error log.
 
+### Forward recovery after an overshoot
+
+On Super 8 in PT detection mode, a confirmed overshoot also offers
+**Save and find next frame** when Nano 1.1.13 recovery support is detected.
+This explicitly saves the partial current frame with its regular number, then
+seeks the **next** physical frame. Forward movement cannot restore the cropped
+area of the frame that has already passed the target. Ordinary **Save and
+continue** retains its existing behavior.
+
+Recovery uses command 42 (the existing manual/visual movement command), with
+acknowledged moves of at most eight steps. Collection stays suspended throughout
+movement, camera checks and capture. Each checked position needs two fresh,
+settled exposures. The detector must follow the old complete sprocket towards
+the top edge and observe the next complete sprocket entering from the bottom
+before accepting it near the center. It uses the strip/adaptive detector; YOLO
+does not authorize recovery travel.
+
+Unknown detections only permit a bounded crossing after the old sprocket has
+reached the top-edge region. A missing next hole, unexpected movement, stationary
+disagreement, or a second overshoot stops recovery. The Python limits are 1.1
+nominal frame pitches, 80 moves and 90 seconds. Centering uses the configured
+guard tolerance capped at 3%. The nominal pitch comes from the capstan geometry,
+not the minimum PT detection gate. These conservative limits can reject damaged
+film; this mode is not an unrestricted search for any later good frame.
+
+Entry, movement and exit each require matching command-42 acknowledgements.
+A refused command, uncertain send or three-second acknowledgement timeout stops
+without repeating a potentially completed move. Command 42 has no sequence token;
+only one command is outstanding, and an interrupted seek cannot be resumed by
+Retry or Save. The failure dialog offers Stop and identifies the last saved frame;
+inspect the film position before restarting. Stop remains available during recovery.
+
+After the next frame is verified, the controller rebases its PT step counter
+while retaining the stationary hold. The verified camera request is reused for
+normal capture, the next filename/counters advance once, and normal PT scanning
+resumes. Recovery measurements do not feed automatic Fine Tune. An armed frame
+count stop can finish after saving the partial frame without starting recovery.
+All recovery commands, measurements, travel totals and failures appear in the log.
+
 Normal DNG/PNG captures reuse the checked camera request. JPEG uses its RGB image.
 HDR and captures requesting exposure adaptation verify position first, then take
 their required exposures while the film stays stationary.
@@ -117,7 +156,7 @@ trim restoration; it does not establish the cause of every undershoot episode.
 
 ## Nano firmware
 
-`ALT-Scann8-Controller.ino` is now version **1.1.12**. The Pico variants are not
+`ALT-Scann8-Controller.ino` is now version **1.1.13**. The Pico variants are not
 changed. The app probes support rather than relying on a version string.
 
 Command 44 with parameter zero queries alignment support. For movement, the high
@@ -125,6 +164,16 @@ byte is a token (1–127), and the low byte is forward steps (1–40). Response 
 echoes the packed parameter and actual moved steps; zero moved steps means refusal.
 Only a matching acknowledgement completes a pending move. A three-second timeout
 pauses without resending an uncertain movement command.
+
+Command 44 parameter 32767 separately probes forward recovery: response 91 echoes
+32767 with value 2. Older alignment firmware returns zero, leaving recovery
+unavailable while preserving normal corrections. Command 42 parameter 401 enters
+recovery only on a held S8 PT frame; parameter 402 leaves it without advancing.
+Response 90 echoes each parameter with status 1 for success or 0 for refusal.
+During recovery, command 42 allows 1–8 steps per move, up to 1.25 nominal pitches
+in the controller. The normal 1–400-step manual/VFD behavior remains unchanged
+outside recovery. Enter/exit reset the PT interval counter; normal scan/next-frame
+commands are blocked until recovery exits. Stop cancels recovery.
 
 The controller permits nudges only while holding a PT-detected frame, suspends
 collection during that hold, and includes corrective travel in the next frame's
@@ -208,3 +257,10 @@ GUI smoke test with camera and motor access disabled.
 Physical nudge behavior still needs a short live trial across a known troublesome
 cut after flashing. Compare cropped frames, unnecessary pauses, correction count,
 and throughput before using it unattended on a whole reel.
+
+Recovery tests render moving film across several initial overshoots and pitch
+scales, check physical next-frame identity, and exercise missing holes, jams,
+disagreement, movement acknowledgements, stale exposures, stop requests, request
+ownership, counters and advance-send failures. The actual command-42 and Stop
+handlers also run in a C++ transport harness. Physical recovery still needs a
+live trial; these tests do not measure capstan slip or validate damaged-film tracking.

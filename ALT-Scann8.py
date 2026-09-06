@@ -111,7 +111,7 @@ from camera_resolutions import CameraResolutions
 from dynamic_spinbox import DynamicSpinbox
 from tooltip import Tooltips
 from rolling_average import RollingAverage
-from frame_alignment import AlignmentGuard, HoleMeasurement, measure_hole
+from frame_alignment import AlignmentGuard, ForwardRecovery, HoleMeasurement, measure_hole
 from sprocket_yolo import YoloWorker
 
 #  ######### Global variable definition ##########
@@ -344,6 +344,13 @@ AlignmentGuardMode = 'Correct'
 AlignmentGuardTolerance = 3.0  # Percent of capture height, independent of the reporting tolerance
 alignment_guard = None
 alignment_firmware_supported = False
+recovery_firmware_supported = False
+alignment_recovery = None
+recovery_phase = None
+recovery_pending = None
+recovery_result = None
+recovery_deadline = 0
+alignment_last_measurement = None
 alignment_move_pending = None
 alignment_move_result = None
 alignment_move_token = 0
@@ -2616,6 +2623,12 @@ def release_alignment_request():
 def reset_alignment_guard():
     global alignment_guard, alignment_paused, alignment_pause_dialog, alignment_move_pending, alignment_move_result
     global alignment_yolo_pending
+    global alignment_recovery, recovery_phase, recovery_pending, recovery_result, alignment_last_measurement
+    alignment_recovery = None
+    recovery_phase = None
+    recovery_pending = None
+    recovery_result = None
+    alignment_last_measurement = None
     if alignment_yolo_pending is not None:
         alignment_yolo_pending[0].release()
         alignment_yolo_pending = None
@@ -2630,6 +2643,8 @@ def reset_alignment_guard():
 
 
 def retry_alignment_frame():
+    if alignment_recovery is not None:
+        return
     reset_alignment_guard()
     set_alignment_status('Checking held frame')
     win.after(5, capture_loop)
@@ -2648,12 +2663,24 @@ def save_alignment_frame_and_continue():
     save_alignment_frame(True)
 
 
-def save_alignment_frame(continue_scan=False):
+def can_recover_alignment():
+    return (recovery_firmware_supported and FrameDetectMode == 'PFD' and FilmType == 'S8'
+            and alignment_recovery is None and alignment_last_measurement is not None
+            and alignment_last_measurement.offset is not None
+            and alignment_last_measurement.offset < -alignment_last_measurement.height * AlignmentGuardTolerance / 100)
+
+
+def save_alignment_frame_and_recover():
+    if can_recover_alignment():
+        save_alignment_frame(True, recover=True)
+
+
+def save_alignment_frame(continue_scan=False, recover=False):
     """Accept this position once, using the normal filename and capture path."""
     global CurrentFrame, CurrentStill, session_frames, FramesToGo
     global NewFrameAvailable, RetryingFrame, ScanStopRequested
     global last_frame_time
-    if not ScanOngoing or not alignment_paused:
+    if not ScanOngoing or not alignment_paused or alignment_recovery is not None:
         return
     previous_frame = CurrentFrame
     CurrentFrame += 1
@@ -2694,6 +2721,9 @@ def save_alignment_frame(continue_scan=False):
         # fresh interval before exposing an unpaused, guard-free scan state.
         last_frame_time = time.time() + max_inactivity_delay - 2
         reset_alignment_guard()
+        if recover:
+            start_alignment_recovery()
+            return
         # The regular I2C retry path advances an already captured frame without
         # saving/counting it again, including when the first send fails.
         NewFrameAvailable = True
@@ -2726,6 +2756,12 @@ def pause_alignment_frame(reason, image=None):
         f'{filename} has not been saved. The film is held at this frame.\n\n{reason}\n\n'
         'Retry checks the same frame. Save uses the normal scan filename.\n'
         'Choose whether to continue scanning or stop with the film held.'), padx=16, pady=16).pack()
+    if can_recover_alignment():
+        tk.Label(alignment_pause_dialog, text=(
+            'Save and find next frame keeps this image as-is, then aligns the following frame.'),
+            wraplength=650).pack()
+        tk.Button(alignment_pause_dialog, text='Save and find next frame',
+                  command=save_alignment_frame_and_recover).pack(pady=8)
     tk.Button(alignment_pause_dialog, text='Retry this frame', command=retry_alignment_frame).pack(side=LEFT, padx=16, pady=12)
     tk.Button(alignment_pause_dialog, text='Save and continue', command=save_alignment_frame_and_continue).pack(side=LEFT, padx=8, pady=12)
     tk.Button(alignment_pause_dialog, text='Save this frame and stop', command=save_alignment_frame_and_stop).pack(side=LEFT, padx=8, pady=12)
@@ -2735,10 +2771,17 @@ def pause_alignment_frame(reason, image=None):
 
 def receive_alignment_response(payload, moved):
     global alignment_firmware_supported, alignment_move_result
+    global recovery_firmware_supported
     if payload == 0:
         alignment_firmware_supported = Controller_Id == 1 and moved == 1
+        recovery_firmware_supported = False
+        if alignment_firmware_supported:
+            send_arduino_command(CMD_ALIGN_FRAME, 32767)
         set_alignment_status('Ready: automatic correction available' if alignment_firmware_supported
                              else 'Correction unavailable; pause protection active')
+    elif payload == 32767:
+        recovery_firmware_supported = Controller_Id == 1 and moved == 2
+        logging.info('Forward recovery support: %s', recovery_firmware_supported)
     elif alignment_move_pending is not None and payload == alignment_move_pending[0]:
         logging.info('Alignment nudge ack frame=%i token=%i requested_steps=%i reported_steps=%i',
                      CurrentFrame + 1, payload >> 8, payload & 255, moved)
@@ -2775,6 +2818,7 @@ def prepare_alignment_frame():
     global alignment_guard, alignment_request, CaptureSettleDeadline
     global alignment_move_pending, alignment_move_result
     global alignment_yolo_pending
+    global alignment_last_measurement
     if SimulatedRun or CameraDisabled:
         return True
     if AlignmentGuardMode == 'Off' and not AutoFineTuneEnabled:
@@ -2837,6 +2881,7 @@ def prepare_alignment_frame():
                 return False
         stage = ('after_nudge' if alignment_guard.attempts else
                  'confirmation' if alignment_guard.confirming else 'initial')
+        alignment_last_measurement = measurement
         metadata = request.get_metadata()  # Metadata of this request; no extra exposure.
         logging.info('Alignment measurement frame=%i stage=%s nudge=%i offset_px=%s '
                      'offset_pct=%s height_px=%i source=%s sensor_timestamp_ns=%s '
@@ -2906,6 +2951,141 @@ def prepare_alignment_frame():
     finally:
         if request is not None:
             request.release()
+
+
+def send_recovery_command(parameter):
+    """One outstanding command; an uncertain send is never repeated."""
+    global recovery_pending, recovery_result
+    if not ScanOngoing or ScanStopRequested:
+        return False
+    recovery_result = None
+    recovery_pending = (parameter, time.monotonic() + 3)
+    logging.info('Recovery send next_frame=%i parameter=%i', CurrentFrame + 1, parameter)
+    if not send_arduino_command(CMD_ADVANCE_FRAME_FRACTION, parameter):
+        recovery_pending = None
+        pause_alignment_recovery('Movement command delivery is uncertain; it will not be repeated')
+        return False
+    return True
+
+
+def receive_recovery_response(parameter, status):
+    global recovery_result
+    if recovery_pending is None or parameter != recovery_pending[0]:
+        logging.warning('Ignoring unexpected recovery acknowledgement parameter=%i status=%i', parameter, status)
+        return
+    logging.info('Recovery ack next_frame=%i parameter=%i status=%i', CurrentFrame + 1, parameter, status)
+    recovery_result = status
+
+
+def start_alignment_recovery():
+    global alignment_recovery, recovery_phase, recovery_deadline
+    global NewFrameAvailable, RetryingFrame
+    alignment_recovery = ForwardRecovery(FrameStepsS8, AlignmentGuardTolerance)
+    recovery_phase = 'enter'
+    recovery_deadline = time.monotonic() + 90
+    NewFrameAvailable = False
+    RetryingFrame = False
+    logging.info('Recovery starting after saved partial frame=%i; seeking next_frame=%i', CurrentFrame, CurrentFrame + 1)
+    set_alignment_status(f'Finding frame {CurrentFrame + 1}; frame {CurrentFrame} saved as-is')
+    if send_recovery_command(401):
+        win.after(5, capture_loop)
+
+
+def pause_alignment_recovery(reason):
+    """No save/retry shortcut: the film may be between numbered frames."""
+    global alignment_paused, recovery_phase, recovery_pending, alignment_pause_dialog
+    recovery_phase = 'failed'
+    recovery_pending = None
+    release_alignment_request()
+    alignment_paused = True
+    logging.warning('Recovery stopped after frame=%i total_steps=%i: %s',
+                    CurrentFrame, alignment_recovery.total_steps, reason)
+    set_alignment_status(f'Recovery stopped: {reason}')
+    if alignment_pause_dialog is not None:
+        alignment_pause_dialog.destroy()
+    alignment_pause_dialog = tk.Toplevel(win)
+    alignment_pause_dialog.title('Recovery stopped')
+    alignment_pause_dialog.transient(win)
+    tk.Label(alignment_pause_dialog, text=(
+        f'Frame {CurrentFrame} was saved as-is. Frame {CurrentFrame + 1} has not been saved.\n'
+        f'{reason}\n\nThe film may be between frames. Stop and inspect its position before restarting.'),
+        padx=16, pady=16).pack()
+    tk.Button(alignment_pause_dialog, text='Stop', command=stop_alignment_scan).pack(pady=12)
+    alignment_pause_dialog.protocol('WM_DELETE_WINDOW', stop_alignment_scan)
+
+
+def prepare_recovery_frame():
+    """Advance/check on the Tk loop, then hand the verified next exposure to capture."""
+    global recovery_pending, recovery_result, recovery_phase, alignment_recovery
+    global CaptureSettleDeadline, alignment_request, last_frame_time
+    if time.monotonic() > recovery_deadline:
+        pause_alignment_recovery('Recovery exceeded 90 seconds')
+        return False
+    if recovery_pending is not None:
+        parameter, deadline = recovery_pending
+        if recovery_result is None:
+            if time.monotonic() > deadline:
+                pause_alignment_recovery('Timed out waiting for movement acknowledgement; command will not be repeated')
+            return False
+        status = recovery_result
+        recovery_pending = None
+        recovery_result = None
+        if status != 1:
+            pause_alignment_recovery('Controller refused the recovery command')
+            return False
+        if recovery_phase == 'leave':
+            logging.info('Recovery complete next_frame=%i total_steps=%i moves=%i',
+                         CurrentFrame + 1, alignment_recovery.total_steps, alignment_recovery.moves)
+            alignment_recovery = None
+            recovery_phase = None
+            last_frame_time = time.time() + max_inactivity_delay - 2
+            set_alignment_status(f'Frame {CurrentFrame + 1} aligned; resuming normal scan')
+            return True
+        if recovery_phase == 'move':
+            alignment_recovery.moved(parameter)
+        recovery_phase = 'measure'
+        CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME) + StabilizationDelayValue / 1000
+    request = None
+    try:
+        request = capture_settled_request()
+        metadata = request.get_metadata()
+        exposure_start = (metadata['SensorTimestamp'] - metadata['ExposureTime'] * 1000) / 1e9
+        if exposure_start < CaptureSettleDeadline:
+            pause_alignment_recovery('Camera did not provide a settled exposure')
+            return False
+        image = request.make_array('main')
+        height = image.shape[0]
+        shift = FrameVCenterImageShift * height / PreviewHeight if PreviewHeight > 0 else FrameVCenterImageShift
+        measurement = measure_hole(image, FilmType, shift)
+        if ScanStopRequested:
+            return False
+        decision = alignment_recovery.inspect(measurement, target_shift=shift)
+        logging.info('Recovery measurement next_frame=%i phase=%s steps=%i offset_px=%s '
+                     'height_px=%i source=%s decision=%s reason=%s sensor_timestamp_ns=%s',
+                     CurrentFrame + 1, alignment_recovery.phase, alignment_recovery.total_steps,
+                     measurement.offset, height, measurement.source, decision,
+                     alignment_recovery.reason or measurement.reason, metadata.get('SensorTimestamp'))
+        if decision == 'confirm':
+            CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME)
+        elif decision == 'move':
+            request.release()
+            request = None
+            recovery_phase = 'move'
+            send_recovery_command(alignment_recovery.next_steps)
+        elif decision == 'accept':
+            alignment_request = request
+            request = None
+            recovery_phase = 'leave'
+            send_recovery_command(402)
+        else:
+            pause_alignment_recovery(alignment_recovery.reason)
+    except (RuntimeError, KeyError, ValueError, cv2.error) as error:
+        logging.exception('Cannot verify recovery position')
+        pause_alignment_recovery(f'Could not verify recovery position: {error}')
+    finally:
+        if request is not None:
+            request.release()
+    return False
 
 
 def take_alignment_request():
@@ -3528,6 +3708,16 @@ def capture_loop():
     elif ScanOngoing:
         if alignment_paused:
             return
+        recovered_frame_ready = False
+        if alignment_recovery is not None:
+            if not prepare_recovery_frame():
+                if not alignment_paused:
+                    win.after(10, capture_loop)
+                return
+            recovered_frame_ready = True
+            NewFrameAvailable = True
+            scan_error_total_frames_counter += 1
+            scan_error_counter_value.set(f'{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)')
         if FrameDetectMode == 'VFD':
             # If we are in Visual Frame Detection mode, we need to:
             #   - Capture a snap
@@ -3602,7 +3792,7 @@ def capture_loop():
             # If centered, or gone too far, or offset too small to handle, let the code flow in the standard flow to do the normal capture
         if NewFrameAvailable:
             if not RetryingFrame:
-                if FrameDetectMode == 'PFD' and not prepare_alignment_frame():
+                if FrameDetectMode == 'PFD' and not recovered_frame_ready and not prepare_alignment_frame():
                     if not alignment_paused:
                         win.after(10, capture_loop)
                     return
@@ -3878,7 +4068,7 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
     global PtLevelValue, StepsPerFrame
     global scan_error_counter, scan_error_total_frames_counter, scan_error_counter_value
     global steps_completed, steps_submitted
-    global alignment_firmware_supported, alignment_move_result
+    global alignment_firmware_supported, alignment_move_result, recovery_firmware_supported
 
     if not SimulatedRun:
         try:
@@ -3894,7 +4084,7 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
                 logging.warning(
                     f"Non-critical IOError ({e}) while checking incoming event from Arduino. Will check again.")
 
-    if ScanOngoing and FrameDetectMode == 'PFD' and alignment_guard is None and not alignment_paused and time.time() > last_frame_time:  # Do not force new event in case of VFD - Arduino only asked to move the C motor
+    if ScanOngoing and FrameDetectMode == 'PFD' and alignment_guard is None and alignment_recovery is None and not alignment_paused and time.time() > last_frame_time:  # Recovery and guarded holds must never synthesize a frame.
         # If scan is ongoing, and more than 3 seconds have passed since last command, maybe one
         # command from/to Arduino (frame received/go to next frame) has been lost.
         # In such case, we force a 'fake' new frame command to allow process to continue
@@ -3926,17 +4116,27 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
         else:
             refresh_qr_code()
             alignment_firmware_supported = False
+            recovery_firmware_supported = False
             if Controller_Id == 1:
                 send_arduino_command(CMD_ALIGN_FRAME, 0)
     elif ArduinoTrigger == RSP_FORCE_INIT:  # Controller reloaded, sent init sequence again
         logging.debug("Controller requested to reinit")
         alignment_firmware_supported = False
-        if ScanOngoing and alignment_guard is not None:
+        recovery_firmware_supported = False
+        if ScanOngoing and alignment_recovery is not None:
+            pause_alignment_recovery('Controller restarted during recovery')
+        elif ScanOngoing and alignment_guard is not None:
             pause_alignment_frame('Controller restarted during alignment')
         reinit_controller()
         if Controller_Id == 1:
             send_arduino_command(CMD_ALIGN_FRAME, 0)
     elif ArduinoTrigger == RSP_FRAME_AVAILABLE:  # New Frame available
+        if alignment_recovery is not None:
+            pause_alignment_recovery('Unexpected PT frame event during recovery')
+            ArduinoTrigger = 0
+            if not ExitingApp:
+                arduino_after = win.after(10, arduino_listen_loop)
+            return
         # The controller sends its actual detection-interval step count and
         # raw PT reading. The threshold below is the latest reported value,
         # not a simultaneous threshold sample from this event.
@@ -3996,8 +4196,13 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
     elif ArduinoTrigger == RSP_ALIGN_FRAME:
         receive_alignment_response(ArduinoParam1, ArduinoParam2)
     elif ArduinoTrigger == RSP_ADVANCE_FRAME_FRACTION:  
-        logging.debug(f"Received confirmation of {ArduinoParam1} steps done from Arduino")
-        steps_completed = True
+        if alignment_recovery is not None:
+            receive_recovery_response(ArduinoParam1, ArduinoParam2)
+        elif FrameDetectMode == 'VFD':
+            logging.debug(f"Received confirmation of {ArduinoParam1} steps done from Arduino")
+            steps_completed = True
+        else:
+            logging.warning('Ignoring stale movement acknowledgement %i', ArduinoParam1)
     else:
         logging.warning("Unrecognized incoming event (%i) from Arduino.", ArduinoTrigger)
 

@@ -24,7 +24,8 @@ def scanner_functions(*names, **state):
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert len(nodes) == len(names)
     ns = dict(cv2=cv2, np=np, logging=logging, time=time, Image=Image,
-              ConfigData={}, FilmType='S8')
+              ConfigData={}, FilmType='S8', alignment_recovery=None,
+              recovery_firmware_supported=False, alignment_last_measurement=None)
     ns.update(state)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), 'exec'), ns)
     return ns

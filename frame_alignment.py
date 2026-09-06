@@ -153,3 +153,89 @@ class AlignmentGuard:
             self.confirming = False
             self.confirm_source = None
         return 'nudge'
+
+
+class ForwardRecovery:
+    """Seek exactly the next S8 hole after explicitly saving an overshoot.
+
+    Every position needs two stationary exposures. A complete hole must move
+    towards the top, leave there, and the next one must enter from the bottom.
+    Unknown measurements authorize only bounded travel through that edge gap.
+    No frame is accepted merely because travel is approximately one pitch.
+    """
+    def __init__(self, steps_per_frame, tolerance_percent=3):
+        self.pitch = float(steps_per_frame)
+        self.tolerance = min(3, tolerance_percent) / 100
+        self.phase = 'old'
+        self.total_steps = 0
+        self.moves = 0
+        self.next_steps = 0
+        self.last_offset = None
+        self.last_seen_steps = 0
+        self.confirmation = None
+        self.confirming = False
+        self.reason = ''
+        self.target_shift = None
+
+    def inspect(self, measurement, target_shift=0):
+        if measurement.height <= 0 or self.pitch <= 0:
+            return self.fail('Invalid recovery geometry')
+        shift = target_shift / measurement.height
+        if self.target_shift is not None and abs(shift - self.target_shift) > 1e-6:
+            return self.fail('Recovery target changed while moving')
+        self.target_shift = shift
+        offset = None if measurement.offset is None else measurement.offset / measurement.height
+        if not self.confirming:
+            self.confirmation = offset
+            self.confirming = True
+            return 'confirm'
+        self.confirming = False
+        if (offset is None) != (self.confirmation is None) or (
+                offset is not None and abs(offset - self.confirmation) > 0.015):
+            return self.fail('Stationary recovery exposures disagree')
+        if self.last_offset is None:
+            if offset is None or offset >= -self.tolerance:
+                return self.fail('Recovery needs a clearly overshot, complete starting sprocket')
+        elif offset is None:
+            if self.phase != 'old' or self.last_offset + shift > -0.20:
+                return self.fail('Lost the sprocket away from the expected top-edge transition')
+            if self.total_steps - self.last_seen_steps >= self.pitch * 0.55:
+                return self.fail('Next sprocket did not appear within the edge-transition limit')
+        else:
+            travel = self.total_steps - self.last_seen_steps
+            difference = offset - self.last_offset
+            if self.phase == 'old' and self.last_offset + shift <= -0.20 and offset + shift >= 0.15 and difference >= 0.40:
+                if travel <= 0 or travel > self.pitch * 0.55:
+                    return self.fail('Sprocket transition travel is inconsistent')
+                self.phase = 'next'
+            elif difference >= -0.0005 * travel:
+                return self.fail('Recovery movement did not move the same sprocket forward')
+            elif -difference > 0.02 + 0.007 * travel:
+                return self.fail('Sprocket position jumped unexpectedly')
+        if offset is not None:
+            self.last_offset = offset
+            self.last_seen_steps = self.total_steps
+            if self.phase == 'next':
+                if abs(offset) <= self.tolerance:
+                    return 'accept'
+                if offset < -self.tolerance:
+                    return self.fail('Passed the next frame; recovery will not seek another')
+        remaining = int(self.pitch * 1.1) - self.total_steps
+        if remaining <= 0 or self.moves >= 80:
+            return self.fail('Forward recovery travel limit reached')
+        self.next_steps = min(8, remaining)
+        if self.phase == 'next' and offset is not None:
+            self.next_steps = min(self.next_steps,
+                                  max(1, int((offset - self.tolerance / 2) * self.pitch * 0.5)))
+        return 'move'
+
+    def moved(self, steps):
+        """Account only for acknowledged movement, never an attempted send."""
+        if steps != self.next_steps or not 1 <= steps <= 8:
+            raise ValueError('Recovery movement acknowledgement does not match')
+        self.total_steps += steps
+        self.moves += 1
+
+    def fail(self, reason):
+        self.reason = reason
+        return 'pause'
