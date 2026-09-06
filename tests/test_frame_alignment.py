@@ -30,7 +30,7 @@ def scanner_functions(*names, **state):
               recovery_firmware_supported=False, alignment_last_measurement=None,
               alignment_statistics=AlignmentStatistics(), fine_tuner=FineTuner(),
               fine_tune_availability=Mock(return_value=None),
-              notify_scan_problem=Mock(),
+              notify_scan_problem=Mock(), invalidate_phone_commands=Mock(),
               check_arrival_feedback=Mock(return_value=False), refresh_alignment_statistics=Mock())
     ns.update(state)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), 'exec'), ns)

@@ -2789,6 +2789,7 @@ def reset_alignment_guard():
     global alignment_guard, alignment_paused, alignment_pause_dialog, alignment_move_pending, alignment_move_result
     global alignment_yolo_pending
     global alignment_recovery, recovery_phase, recovery_pending, recovery_result, alignment_last_measurement
+    invalidate_phone_commands()
     alignment_recovery = None
     recovery_phase = None
     recovery_pending = None
@@ -2847,6 +2848,7 @@ def save_alignment_frame(continue_scan=False, recover=False):
     global last_frame_time
     if not ScanOngoing or not alignment_paused or alignment_recovery is not None:
         return
+    invalidate_phone_commands()
     previous_frame = CurrentFrame
     CurrentFrame += 1
     session_frames += 1  # HDR exposure order must match the normal scan path.
@@ -2909,7 +2911,7 @@ def pause_alignment_frame(reason, image=None):
     global alignment_paused, alignment_pause_dialog
     release_alignment_request()
     alignment_paused = True
-    notify_scan_problem('guard_pause', CurrentFrame + 1, f'Frame not saved; scanning paused. {reason}')
+    notify_scan_problem('guard_pause', CurrentFrame + 1, f'Frame not saved; scanning paused. {reason}', image=image)
     record = alignment_statistics.frame(CurrentFrame + 1, time.monotonic())
     record.paused = True
     if record.arrival == 'unmeasured':
@@ -3174,7 +3176,7 @@ def start_alignment_recovery():
         win.after(5, capture_loop)
 
 
-def pause_alignment_recovery(reason):
+def pause_alignment_recovery(reason, image=None, measurement=None):
     """No save/retry shortcut: the film may be between numbered frames."""
     global alignment_paused, recovery_phase, recovery_pending, alignment_pause_dialog
     recovery_phase = 'failed'
@@ -3182,7 +3184,8 @@ def pause_alignment_recovery(reason):
     release_alignment_request()
     alignment_paused = True
     notify_scan_problem('recovery_failed', CurrentFrame + 1,
-                        f'Frame {CurrentFrame} saved as-is; next frame not saved. {reason}')
+                        f'Frame {CurrentFrame} saved as-is; next frame not saved. {reason}',
+                        image=image, measurement=measurement)
     alignment_statistics.frame(CurrentFrame + 1, time.monotonic()).recovery_failed = True
     logging.warning('Recovery stopped after frame=%i total_steps=%i: %s',
                     CurrentFrame, alignment_recovery.total_steps, reason)
@@ -3273,7 +3276,7 @@ def prepare_recovery_frame():
             recovery_phase = 'leave'
             send_recovery_command(402)
         else:
-            pause_alignment_recovery(alignment_recovery.reason)
+            pause_alignment_recovery(alignment_recovery.reason, request.make_image('main'), measurement)
     except (RuntimeError, KeyError, ValueError, cv2.error) as error:
         logging.exception('Cannot verify recovery position')
         pause_alignment_recovery(f'Could not verify recovery position: {error}')
@@ -5360,9 +5363,59 @@ def create_main_window():
 
 
 # Define a custom exception hook to log uncaught exceptions
-def notify_scan_problem(kind, frame, reason):
+def invalidate_phone_commands():
+    if ntfy_notifier is not None:
+        ntfy_notifier.commands.invalidate()
+
+
+def poll_phone_commands():
+    """Only Tk executes scanner operations; network threads cannot touch hardware."""
     try:
-        ntfy_notifier.notify(kind, frame, reason, folder=CurrentDir, run_id=alignment_statistics.run_id)
+        if not ScanOngoing or not alignment_paused or ScanStopRequested:
+            invalidate_phone_commands()
+        else:
+            kind = 'recovery_failed' if alignment_recovery is not None else 'guard_pause'
+            frame = CurrentFrame + 1
+            context = (alignment_statistics.run_id, CurrentDir, frame, kind)
+            command = ntfy_notifier.commands.take(context)
+            handlers = {'stop': stop_alignment_scan}
+            if kind == 'guard_pause':
+                handlers.update(retry=retry_alignment_frame, save=save_alignment_frame_and_continue)
+            if command in handlers:
+                try:
+                    handlers[command]()
+                    result = {'retry': 'Retry requested; checking alignment again.',
+                              'stop': 'Scan stopped.',
+                              'save': 'Frame accepted; normal saving queued.' if CurrentFrame == frame
+                                      else 'Frame could not be accepted; inspect the scanner.'}[command]
+                except Exception:
+                    logging.exception('Phone command handler failed')
+                    result = 'Command failed; inspect the scanner before continuing.'
+                ntfy_notifier.notify('command_result', frame, result, folder=CurrentDir)
+    except Exception:
+        logging.warning('Could not process phone command')
+    finally:
+        win.after(250, poll_phone_commands)
+
+
+def notify_scan_problem(kind, frame, reason, image=None, measurement=None):
+    try:
+        actions, incident, overlay = None, None, None
+        if kind in ('guard_pause', 'recovery_failed'):
+            context = (alignment_statistics.run_id, CurrentDir, frame, kind)
+            allowed = ('retry', 'save', 'stop') if kind == 'guard_pause' else ('stop',)
+            actions, incident = ntfy_notifier.commands.arm(context, allowed)
+            if actions:
+                reason += '\nPhone buttons expire in 30 minutes and work once for this pause.'
+            if kind == 'guard_pause':
+                measurement = alignment_last_measurement
+            if image is not None and measurement is not None:
+                overlay = (None if measurement.offset is None else measurement.offset / measurement.height,
+                           AlignmentGuardTolerance,
+                           FrameVCenterImageShift / PreviewHeight if PreviewHeight > 0 else
+                           FrameVCenterImageShift / measurement.height, measurement.source)
+        ntfy_notifier.notify(kind, frame, reason, folder=CurrentDir, run_id=alignment_statistics.run_id,
+                             image=image, overlay=overlay, actions=actions, incident=incident)
     except Exception:
         logging.warning('Could not queue scanner notification')
 
@@ -7854,6 +7907,8 @@ def main(argv):
         hw_panel.ALT_Scann8_init_completed()
 
     onesec_periodic_checks()
+
+    poll_phone_commands()
 
     # Main Loop
     win.mainloop()  # running the loop that works as a trigger
