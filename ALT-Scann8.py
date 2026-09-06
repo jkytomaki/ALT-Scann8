@@ -2904,6 +2904,10 @@ def prepare_alignment_frame():
             offset_image.add_value(measurement.offset * int(CaptureResolution.split('x')[1]) / height)
             adjust_auto_fine_tune()
         decision = 'accept' if AlignmentGuardMode == 'Off' else alignment_guard.inspect(measurement)
+        if decision in ('confirm', 'nudge') or alignment_guard.attempts:
+            # Show the checked position before movement and after every nudge,
+            # including the final accepted position, without another exposure.
+            draw_preview_image(request.make_image('main'), CurrentFrame + 1, 0, force=True)
         if decision == 'accept':
             if alignment_guard.attempts:
                 logging.info('Alignment corrected before frame %i: %i steps in %i attempts, residual %.1f px',

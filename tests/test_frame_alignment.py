@@ -269,7 +269,7 @@ class PreflightTests(unittest.TestCase):
             auto_fine_tune_limit_warned=False,
             CurrentFrame=42, send_alignment_nudge=Mock(return_value=True), measure_hole=Mock(side_effect=measurements),
             offset_image=average, CaptureResolution='4056x3040', adjust_auto_fine_tune=Mock(),
-            set_alignment_status=Mock(), pause_alignment_frame=Mock())
+            set_alignment_status=Mock(), pause_alignment_frame=Mock(), draw_preview_image=Mock())
         return ns, requests
 
     def test_dng_feedback_runs_without_reporting_or_rawpy(self):

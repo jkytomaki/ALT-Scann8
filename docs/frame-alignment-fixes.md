@@ -84,6 +84,9 @@ All recovery commands, measurements, travel totals and failures appear in the lo
 Normal DNG/PNG captures reuse the checked camera request. JPEG uses its RGB image.
 HDR and captures requesting exposure adaptation verify position first, then take
 their required exposures while the film stays stationary.
+During ordinary guard corrections, the preview also displays the checked position
+before movement and after every nudge, including the final accepted position.
+These updates use existing exposures and bypass the normal preview interval.
 
 ### Damaged sprocket fallback
 
