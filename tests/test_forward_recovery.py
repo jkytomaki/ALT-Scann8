@@ -137,6 +137,7 @@ class RecoveryIntegrationTests(unittest.TestCase):
             time=clock, CurrentFrame=42, StabilizationDelayValue=250, FrameVCenterImageShift=0,
             PreviewHeight=500, max_inactivity_delay=12, CaptureSettleDeadline=10,
             pause_alignment_recovery=Mock(), set_alignment_status=Mock(),
+            draw_preview_image=Mock(),
             send_arduino_command=Mock(return_value=True), CMD_ADVANCE_FRAME_FRACTION=42,
             capture_settled_request=Mock(side_effect=capture_request),
             measure_hole=Mock(return_value=HoleMeasurement(-200, 1000)))

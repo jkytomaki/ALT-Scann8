@@ -2050,13 +2050,13 @@ def enable_canvas(canvas):
     # Re-enable other relevant events
 
 
-def draw_preview_image(preview_image, curframe, idx):
+def draw_preview_image(preview_image, curframe, idx, *, force=False):
     global total_wait_time_preview_display, PreviewModuleValue, preview_image_id_to_delete, IsSplashDisplayed, RealTimeZoom, ZoomSize, RealTimeDisplay
     global preview_image_id_to_delete, IsSplashDisplayed, FocusViewEnabled, ScanOngoing, FocusPeakingEnabled
 
     curtime = time.time()
 
-    if curframe % PreviewModuleValue == 0 and preview_image is not None:
+    if (force or curframe % PreviewModuleValue == 0) and preview_image is not None:
         if FocusViewEnabled and FocusPeakingEnabled and preview_image is not None:
             try:
                 img_rgb = preview_image.convert("RGB")
@@ -3060,6 +3060,13 @@ def prepare_recovery_frame():
         if ScanStopRequested:
             return False
         decision = alignment_recovery.inspect(measurement, target_shift=shift)
+        # Show the same settled exposure used for tracking, even when normal
+        # previews are configured to skip frames. No additional camera capture.
+        draw_preview_image(request.make_image('main'), CurrentFrame + 1, 0, force=True)
+        offset_status = ('checking sprocket' if measurement.offset is None else
+                         f'offset {100 * measurement.offset / height:+.1f}%')
+        set_alignment_status(f'Finding frame {CurrentFrame + 1}: '
+                             f'{alignment_recovery.total_steps} steps; {offset_status}')
         logging.info('Recovery measurement next_frame=%i phase=%s steps=%i offset_px=%s '
                      'height_px=%i source=%s decision=%s reason=%s sensor_timestamp_ns=%s',
                      CurrentFrame + 1, alignment_recovery.phase, alignment_recovery.total_steps,

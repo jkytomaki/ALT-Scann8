@@ -52,7 +52,9 @@ continue** retains its existing behavior.
 Recovery uses command 42 (the existing manual/visual movement command), with
 acknowledged moves of at most eight steps. Collection stays suspended throughout
 movement, camera checks and capture. Each checked position needs two fresh,
-settled exposures. The detector must follow the old complete sprocket towards
+settled exposures. Recovery refreshes the preview from those same exposures,
+regardless of the normal preview interval, and displays travel and current offset.
+The detector must follow the old complete sprocket towards
 the top edge and observe the next complete sprocket entering from the bottom
 before accepting it near the center. It uses the strip/adaptive detector; YOLO
 does not authorize recovery travel.
