@@ -2,6 +2,7 @@
 import ast
 from datetime import datetime
 import logging
+import json
 from pathlib import Path
 import queue
 import tempfile
@@ -15,6 +16,7 @@ import numpy as np
 from PIL import Image
 from rolling_average import RollingAverage
 from frame_alignment import AlignmentGuard, HoleMeasurement, measure_hole
+from alignment_feedback import FineTuner, AlignmentStatistics
 
 SOURCE = Path(__file__).resolve().parents[1] / 'ALT-Scann8.py'
 
@@ -23,9 +25,12 @@ def scanner_functions(*names, **state):
     tree = ast.parse(SOURCE.read_text())
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert len(nodes) == len(names)
-    ns = dict(cv2=cv2, np=np, logging=logging, time=time, Image=Image,
+    ns = dict(cv2=cv2, np=np, logging=logging, json=json, time=time, Image=Image,
               ConfigData={}, FilmType='S8', alignment_recovery=None,
-              recovery_firmware_supported=False, alignment_last_measurement=None)
+              recovery_firmware_supported=False, alignment_last_measurement=None,
+              alignment_statistics=AlignmentStatistics(), fine_tuner=FineTuner(),
+              fine_tune_availability=Mock(return_value=None),
+              check_arrival_feedback=Mock(return_value=False), refresh_alignment_statistics=Mock())
     ns.update(state)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(SOURCE), 'exec'), ns)
     return ns
@@ -97,44 +102,46 @@ class DetectionTests(unittest.TestCase):
 
 
 class FineTuneTests(unittest.TestCase):
-    def test_never_sends_values_rejected_by_firmware(self):
-        for start, offset, expected in [(90, 300, 95), (10, -300, 5)]:
-            average = RollingAverage(5)
-            average.add_value(offset)
-            sender = Mock(return_value=True)
-            ns = scanner_functions('adjust_auto_fine_tune', offset_image=average,
-                FrameFineTuneValue=start, PreviousFrameFineTuneValue=start,
-                auto_fine_tune_wait=0, auto_fine_tune_limit_warned=False,
-                CaptureResolution='4056x3040', CMD_SET_FRAME_FINE_TUNE=54, ExpertMode=True,
-                send_arduino_command=sender, frame_fine_tune_value=Mock())
-            ns['adjust_auto_fine_tune']()
-            sender.assert_called_once_with(54, expected)
-            self.assertEqual(ns['ConfigData']['FrameFineTune'], expected)
-            self.assertEqual(ns['ConfigData']['FrameFineTuneS8'], expected)
+    def state(self, value=25, success=True, expert=True):
+        ns = scanner_functions('adjust_auto_fine_tune', FrameFineTuneValue=value,
+            PreviousFrameFineTuneValue=value, CurrentFrame=0, ScanStopRequested=False,
+            CMD_SET_FRAME_FINE_TUNE=54, ExpertMode=expert,
+            send_arduino_command=Mock(return_value=success), frame_fine_tune_value=Mock())
+        return ns
 
+    def feed(self, ns, offset=30):
+        for frame in range(1, 14):
+            ns['CurrentFrame'] = frame - 1
+            ns['alignment_statistics'].frame(frame, frame, origin='pt', settings=dict(
+                reported_steps=280, pt_valid=True, steps=250, extra_steps=0, film='S8',
+                steps_auto=False, speed=5, vcenter=0, resolution='4056x3040', capstan=14.6))
+            ns['adjust_auto_fine_tune'](HoleMeasurement(offset, 1000), True, 'strips')
+
+    def test_small_adjustment_persists_only_after_success(self):
+        ns = self.state()
+        self.feed(ns)
+        ns['send_arduino_command'].assert_called_once_with(54, 26)
+        self.assertEqual(ns['ConfigData']['FrameFineTune'], 26)
+        self.assertEqual(ns['ConfigData']['FrameFineTuneS8'], 26)
+
+    def test_never_sends_values_rejected_by_firmware(self):
+        for value, offset in ((95, 30), (5, -30)):
+            ns = self.state(value)
+            self.feed(ns, offset)
+            ns['send_arduino_command'].assert_not_called()
+            self.assertTrue(ns['auto_fine_tune_limit_warned'])
 
     def test_basic_mode_does_not_require_expert_widgets(self):
-        average = RollingAverage(5)
-        average.add_value(300)
-        ns = scanner_functions('adjust_auto_fine_tune', offset_image=average,
-            FrameFineTuneValue=20, PreviousFrameFineTuneValue=20,
-            auto_fine_tune_wait=0, auto_fine_tune_limit_warned=False,
-            CaptureResolution='4056x3040', CMD_SET_FRAME_FINE_TUNE=54, ExpertMode=False,
-            send_arduino_command=Mock(return_value=True))
-        ns['adjust_auto_fine_tune']()
-        self.assertEqual(ns['FrameFineTuneValue'], 30)
+        ns = self.state(expert=False)
+        del ns['frame_fine_tune_value']
+        self.feed(ns)
+        self.assertEqual(ns['FrameFineTuneValue'], 26)
 
     def test_failed_setting_write_does_not_claim_success(self):
-        average = RollingAverage(5)
-        average.add_value(300)
-        ns = scanner_functions('adjust_auto_fine_tune', offset_image=average,
-            FrameFineTuneValue=20, PreviousFrameFineTuneValue=20,
-            auto_fine_tune_wait=0, auto_fine_tune_limit_warned=False,
-            CaptureResolution='4056x3040', CMD_SET_FRAME_FINE_TUNE=54, ExpertMode=True,
-            send_arduino_command=Mock(return_value=False), frame_fine_tune_value=Mock())
-        ns['adjust_auto_fine_tune']()
-        self.assertEqual(ns['FrameFineTuneValue'], 20)
-        self.assertEqual(ns['PreviousFrameFineTuneValue'], 20)
+        ns = self.state(success=False)
+        self.feed(ns)
+        self.assertEqual(ns['FrameFineTuneValue'], 25)
+        self.assertEqual(ns['PreviousFrameFineTuneValue'], 25)
         ns['frame_fine_tune_value'].set.assert_not_called()
         self.assertNotIn('FrameFineTune', ns['ConfigData'])
 
@@ -258,6 +265,7 @@ class PreflightTests(unittest.TestCase):
             requests.append(request)
         average = RollingAverage(5)
         ns = scanner_functions('prepare_alignment_frame', 'take_alignment_request',
+            'check_arrival_feedback', 'record_alignment_arrival',
             alignment_guard=None, alignment_request=None, alignment_yolo_pending=None,
             alignment_yolo_worker=Mock(), HoleMeasurement=HoleMeasurement,
             SimulatedRun=False, CameraDisabled=False,
@@ -272,11 +280,11 @@ class PreflightTests(unittest.TestCase):
             set_alignment_status=Mock(), pause_alignment_frame=Mock(), draw_preview_image=Mock())
         return ns, requests
 
-    def test_dng_feedback_runs_without_reporting_or_rawpy(self):
+    def test_single_exposure_reused_without_unconfirmed_tuning(self):
         ns, requests = self.preflight([HoleMeasurement(20, 1000)], mode='Off')
         self.assertTrue(ns['prepare_alignment_frame']())
-        ns['adjust_auto_fine_tune'].assert_called_once()
-        self.assertAlmostEqual(ns['offset_image'].get_average(), 60.8)
+        ns['adjust_auto_fine_tune'].assert_not_called()
+        self.assertIsNone(ns['offset_image'].get_average())
         self.assertIs(ns['take_alignment_request'](), requests[0])
         self.assertIsNone(ns['alignment_request'])
         requests[0].release.assert_not_called()
@@ -287,14 +295,14 @@ class PreflightTests(unittest.TestCase):
         self.assertFalse(ns['prepare_alignment_frame']())
         ns['pause_alignment_frame'].assert_called_once()
         ns['adjust_auto_fine_tune'].assert_called_once()
-        self.assertEqual(len(ns['offset_image'].window), 1)
+        self.assertEqual(len(ns['offset_image'].window), 0)
         for request in requests:
             request.release.assert_called_once()
 
     def test_unknown_never_feeds_trim_loop(self):
         ns, _ = self.preflight([HoleMeasurement(None, 1000)], mode='Off')
         self.assertTrue(ns['prepare_alignment_frame']())
-        ns['adjust_auto_fine_tune'].assert_not_called()
+        self.assertIsNone(ns['adjust_auto_fine_tune'].call_args.args[0].offset)
         self.assertIsNone(ns['offset_image'].get_average())
 
     def test_stale_exposure_pauses_instead_of_failing_open(self):

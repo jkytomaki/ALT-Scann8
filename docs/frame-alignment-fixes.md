@@ -4,6 +4,67 @@ Branch: `frame-alignment-fixes`, based on the Pi's deployed `651f5d8`.
 
 ## Behavior
 
+### Verified Auto Fine Tune
+
+There is one Auto Fine Tune algorithm. It now uses confirmed camera feedback
+instead of the old five-sample average and up-to-ten-point jumps. The controls
+are independent: with **PT Level Auto** on and **Visual Detection** off, Auto Fine
+Tune can operate with the guard **Off**, **Pause** or **Correct**. Guard Off still
+means no framing pauses or corrective nudges; uncertain tuning samples are ignored.
+Manual PT and Visual Detection make the tuner inactive, with the reason displayed
+in Alignment statistics. The manual Fine Tune value remains available as before.
+
+Every fifth clean frame is sampled with two fresh, settled exposures. Suspect
+frames reuse the guard's existing confirmation. Pairs must agree within 1.5% of
+image height, and feedback is recorded once from the original stop, before any
+nudge. Single-exposure checks, YOLO results, uncertain/extreme offsets (over 25%),
+invalid PT readings, missing stop telemetry, and stops within two steps of the
+minimum detection gate do not adjust the tuner. Recovery does not feed it.
+
+After five frames of settings warmup, at least eight verified samples and a
+75% majority outside a 1% deadband are required. A change is exactly one Fine Tune
+point, bounded to 5–95. It then waits 20 frames and collects fresh evidence.
+Reversing direction needs 16 samples and a 1.5% deadband. Configuration changes,
+recovery, long sampling gaps and pauses over 60 seconds discard stale evidence.
+Failed sends retain the displayed/saved value and wait before collecting more
+evidence; successful I2C writes update both live and saved trim values. The existing
+threshold-setting command has no controller acknowledgement, so logs say `sent`,
+not hardware-readback-verified. Each proposed change logs its evidence, settings,
+frame and statistics run ID as `Alignment tuning` JSON.
+
+### Alignment statistics
+
+The expert Frame align panel shows a compact summary and an **Alignment statistics**
+button. Its detail window compares the last 100 frame positions with the current
+scan session: aligned-on-arrival percentage, undershoots, overshoots, unknown and
+unmeasured arrivals, median signed offset, 95th-percentile absolute error,
+correction frames/nudges/acknowledged steps, pauses, recovery attempts/results/steps,
+saved-as-is overrides, captures and effective frames/sec. It also shows tuner status
+and the current guard tolerance, PT, Fine Tune and step settings.
+
+Statistics use original PT-stop positions. Clean guard checks use the usual
+multi-strip evidence; suspect positions and sampled tuning positions require two
+exposures. The separate confirmation count identifies those pairs. Disagreeing
+pairs are unknown, rather than silently replaced by a later corrected position.
+Unknown and unmeasured arrivals remain in the PT-arrival denominator. If nothing
+has been measured, the aligned percentage is unavailable. With guard Off and
+Auto Fine Tune inactive, no extra camera checks run and arrivals remain unmeasured.
+Camera-recovered positions are excluded from PT-arrival quality statistics.
+
+Counts are per frame, so Retry does not rewrite the arrival or double-count
+captures/pauses. Ordinary nudge steps count only after matching acknowledgements.
+“Saved as-is” means explicit acceptance; it does not prove picture area was lost.
+“Captured” means the exposure set was captured/queued; file saving can finish later.
+Effective speed includes transport, verification, pauses and recovery. Stop freezes
+the elapsed time; starting another scan resets the panel and gives it a new run ID.
+
+The same snapshot shown in the window is logged as `Alignment statistics` JSON
+at start, every 30 seconds, after 100 additional captures, and at stop/exit. Logs
+include frame bounds, measurement coverage, tolerances, observed Fine Tune/step
+values, current settings and tuner status so changed tolerances or settings do
+not silently masquerade as improved transport accuracy. Historical runs remain
+in the application log. No firmware update is needed for tuning or statistics.
+
 Fine Tune uses camera RGB measurements regardless of DNG output, `rawpy`, or
 “Bad frames”. Feedback runs in capture order before the next transport command;
 background saving only reports errors. Failed hole detection contributes no
