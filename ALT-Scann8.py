@@ -111,12 +111,10 @@ from camera_resolutions import CameraResolutions
 from dynamic_spinbox import DynamicSpinbox
 from tooltip import Tooltips
 from rolling_average import RollingAverage
-
-try:
-    import rawpy
-    can_check_dng_frames_for_misalignment = True
-except ImportError:
-    can_check_dng_frames_for_misalignment = False
+from frame_alignment import AlignmentGuard, ForwardRecovery, HoleMeasurement, measure_hole
+from alignment_feedback import FineTuner, AlignmentStatistics
+from alignment_statistics_view import AlignmentStatisticsWindow
+from sprocket_yolo import YoloWorker
 
 #  ######### Global variable definition ##########
 win = None
@@ -164,6 +162,7 @@ ScanOngoing = False  # PlayState in original code from Torulf (opposite meaning)
 FrameDetectMode = 'PFD'    # By default scanner works in traditional mode, with Phototransistor Frame Detection (vs VFD)
 ScanStopRequested = False  # To handle stopping scan process asynchronously, with same button as start scan
 NewFrameAvailable = False  # To be set to true upon reception of Arduino event
+RetryingFrame = False  # True while re-capturing a frame after an Arduino I/O error, to avoid re-counting it
 ScanProcessError = False  # To be set to true upon reception of Arduino event
 ScanProcessError_LastTime = 0
 # Directory where python scrips run, to store the json file with persistent data
@@ -265,6 +264,7 @@ CMD_SINGLE_STEP = 40
 CMD_ADVANCE_FRAME = 41
 CMD_ADVANCE_FRAME_FRACTION = 42
 CMD_RUN_FILM_COLLECTION = 43
+CMD_ALIGN_FRAME = 44
 CMD_SET_PT_LEVEL = 50
 CMD_SET_MIN_FRAME_STEPS = 52
 CMD_SET_FRAME_FINE_TUNE = 54
@@ -294,6 +294,7 @@ RSP_REPORT_PLOTTER_INFO = 87
 RSP_SCAN_ENDED = 88
 RSP_FILM_FORWARD_ENDED = 89
 RSP_ADVANCE_FRAME_FRACTION = 90
+RSP_ALIGN_FRAME = 91
 
 # Options variables
 ExpertMode = True
@@ -335,11 +336,39 @@ PreviousFrameFineTuneValue = 0
 FrameExtraStepsValue = 0
 ScanSpeedValue = 5
 StabilizationDelayValue = 100
+CaptureSettleDeadline = 0.0  # CLOCK_BOOTTIME time after which the film is considered settled
 ExposureWbAdaptPause = False
 # Variables to handle auto fine tune
 AutoFineTuneEnabled = True
-offset_image = None # RollingAverage object to allow to automatically set the fine tune value
-auto_fine_tune_wait = 0 # To allow waiting a few frames to allow auto fine tune value to have an effect
+AlignmentGuardMode = 'Correct'
+AlignmentGuardTolerance = 3.0  # Percent of capture height, independent of the reporting tolerance
+alignment_guard = None
+alignment_firmware_supported = False
+recovery_firmware_supported = False
+alignment_recovery = None
+recovery_phase = None
+recovery_pending = None
+recovery_result = None
+recovery_deadline = 0
+alignment_last_measurement = None
+alignment_move_pending = None
+alignment_move_result = None
+alignment_move_token = 0
+alignment_request = None
+alignment_yolo_pending = None
+alignment_yolo_worker = YoloWorker()
+alignment_paused = False
+alignment_pause_dialog = None
+alignment_guard_mode_var = None
+alignment_guard_tolerance_var = None
+alignment_status_var = None
+fine_tuner = FineTuner()
+alignment_statistics = AlignmentStatistics()
+alignment_stats_button_var = None
+alignment_stats_window = None
+alignment_stats_last_log = 0
+alignment_stats_logged_captures = 0
+auto_fine_tune_limit_warned = False # To warn only once while auto fine tune is stuck at a range limit
 FrameVCenterEnabled = False
 FrameVCenterImage = None    # Used to temporarily save the imag eused to allow the user to vertically center the image
 FrameVCenterHoleShift = 0   # Offset of the hole center respect to the image center
@@ -450,6 +479,9 @@ total_wait_time_save_image = 0
 total_wait_time_preview_display = 0
 total_wait_time_awb = 0
 total_wait_time_autoexp = 0
+# Latest camera metadata, cached by a picamera2 post_callback on every completed
+# request, so status reads do not need a blocking capture_metadata() call
+LastCameraMetadata = None
 time_save_image = None
 time_preview_display = None
 time_awb = None
@@ -543,7 +575,9 @@ ConfigData = {
     "HdrBracketAuto": HdrBracketAuto,
     "HdrMergeInPlace": HdrMergeInPlace,
     "FramesToGo": FramesToGo,
-    "AutoFineTuneEnabled": True
+    "AutoFineTuneEnabled": True,
+    "AlignmentGuardMode": AlignmentGuardMode,
+    "AlignmentGuardTolerance": AlignmentGuardTolerance
 }
 
 Simulated_PT_Levels = [(546, 373),(382, 373),(52, 373),(14, 373),(59, 373),(41, 373),(151, 373),(269, 371),
@@ -586,6 +620,12 @@ def exit_app(do_save):  # Exit Application
     global ExitingApp
     global hw_panel, hw_panel_installed
 
+    if alignment_statistics.started is not None and alignment_statistics.stopped is None:
+        if alignment_recovery is not None:
+            alignment_statistics.frame(CurrentFrame + 1, time.monotonic()).recovery_failed = True
+        alignment_statistics.stop(time.monotonic())
+        refresh_alignment_statistics(True, 'exit')
+    reset_alignment_guard()
     log_current_session()   # Before exiting, write session data to disk
 
     # *** ALT-Scann8 shutdown starts ***
@@ -862,13 +902,13 @@ def cmd_detect_misaligned_frames():
     global DetectMisalignedFrames, misaligned_tolerance_label
     DetectMisalignedFrames = detect_misaligned_frames.get()
     ConfigData["DetectMisalignedFrames"] = DetectMisalignedFrames
-    scan_error_counter_value_label.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+    if ExpertMode: scan_error_counter_value_label.config(state = NORMAL if DetectMisalignedFrames else DISABLED)
 
 
 def cmd_select_file_type(selected):
     global FileType
-    misaligned_tolerance_label.config(state = NORMAL if detect_misaligned_frames.get() and (file_type_dropdown_selected.get() != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
-    misaligned_tolerance_spinbox.config(state = NORMAL if detect_misaligned_frames.get() and (file_type_dropdown_selected.get() != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+    if ExpertMode: misaligned_tolerance_label.config(state = NORMAL if detect_misaligned_frames.get() else DISABLED)
+    misaligned_tolerance_spinbox.config(state = NORMAL if detect_misaligned_frames.get() else DISABLED)
 
 
 
@@ -918,7 +958,7 @@ def cmd_settings_popup_accept():
             AutoWbEnabled = ConfigData['AutoWbEnabled']
             AutoFrameStepsEnabled = ConfigData['AutoFrameStepsEnabled']  # FrameStepsAuto
             AutoPtLevelEnabled = ConfigData['AutoPtLevelEnabled']  # PTLevelAuto
-            FrameFineTuneValue = ConfigData["FrameFineTune"]
+            FrameFineTuneValue = max(5, min(95, ConfigData["FrameFineTune"]))
             ScanSpeedValue = ConfigData["ScanSpeed"]
             AutoFineTuneEnabled = ConfigData["AutoFineTuneEnabled"]
         if not SimulatedRun and not CameraDisabled:
@@ -1005,8 +1045,8 @@ def cmd_settings_popup_accept():
     capture_info_str.set(f"{FileType} - {CaptureResolution}")
 
     if not SimplifiedMode:
-        detect_misaligned_frames_btn.config(state = NORMAL if (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
-        scan_error_counter_value_label.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+        if ExpertMode: detect_misaligned_frames_btn.config(state=NORMAL)
+        if ExpertMode: scan_error_counter_value_label.config(state = NORMAL if DetectMisalignedFrames else DISABLED)
 
     if DisableToolTips:
         as_tooltips.disable()
@@ -1195,8 +1235,8 @@ def cmd_settings_popup():
     options_ok_btn.grid(row=options_row, column=1, padx=10, pady=5, sticky='E')
 
     # arrange status for multidependent widgets. Initially enabled, increase counter for each disable condition   
-    misaligned_tolerance_label.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
-    misaligned_tolerance_spinbox.config(state = NORMAL if DetectMisalignedFrames and (FileType != "dng" or can_check_dng_frames_for_misalignment) else DISABLED)
+    if ExpertMode: misaligned_tolerance_label.config(state = NORMAL if DetectMisalignedFrames else DISABLED)
+    misaligned_tolerance_spinbox.config(state = NORMAL if DetectMisalignedFrames else DISABLED)
 
     options_dlg.protocol("WM_DELETE_WINDOW", cmd_settings_popup_dismiss)  # intercept close button
     options_dlg.transient(win)  # dialog window is related to main
@@ -1555,7 +1595,7 @@ def rwnd_speed_up():
 
 def cmd_frame_extra_steps_selection():
     global FrameExtraStepsValue
-    FrameExtraStepsValue = value_normalize(frame_extra_steps_value, 0, 30, 0)
+    FrameExtraStepsValue = value_normalize(frame_extra_steps_value, -30, 150, 0)
     ConfigData["FrameExtraSteps"] = FrameExtraStepsValue
     send_arduino_command(CMD_SET_EXTRA_STEPS, FrameExtraStepsValue)
 
@@ -1755,32 +1795,105 @@ def debug_display_image(window_name, img, factor=1):
             cv2.destroyWindow(window_name)
 
 
-def adjust_auto_fine_tune():
-    global FrameFineTuneValue, PreviousFrameFineTuneValue, auto_fine_tune_wait
-    offset_avg = offset_image.get_average()
-    if offset_avg == None:
-        return  # Too early as to rely on average (less than 50 samples)
-    else:
-        offset_avg = int(offset_avg)
-    if auto_fine_tune_wait > 0:
-        auto_fine_tune_wait -= 1
+def fine_tune_availability():
+    if not AutoFineTuneEnabled:
+        return 'Manual Fine Tune'
+    if not AutoPtLevelEnabled:
+        return 'Auto Fine Tune needs PT Level Auto'
+    if FrameDetectMode != 'PFD':
+        return 'Auto Fine Tune inactive in Visual Detection'
+    if CameraDisabled or SimulatedRun:
+        return 'Auto Fine Tune needs a live camera'
+    return None
+
+
+def alignment_settings():
+    return dict(guard=AlignmentGuardMode, tolerance_pct=AlignmentGuardTolerance,
+        pt_auto=AutoPtLevelEnabled, pt_threshold=PtLevelValue,
+        fine_auto=AutoFineTuneEnabled, fine_tune=FrameFineTuneValue,
+        steps_auto=AutoFrameStepsEnabled, steps=StepsPerFrame, extra_steps=FrameExtraStepsValue,
+        speed=ScanSpeedValue, settle_ms=StabilizationDelayValue, film=FilmType,
+        vcenter=FrameVCenterImageShift, resolution=CaptureResolution, capstan=CapstanDiameter,
+        detection=FrameDetectMode)
+
+
+def adjust_auto_fine_tune(measurement, confirmed, source):
+    """Only original, confirmed PT stops can adjust the single threshold tuner."""
+    global FrameFineTuneValue, PreviousFrameFineTuneValue, auto_fine_tune_limit_warned
+    unavailable = fine_tune_availability()
+    record = alignment_statistics.records.get(CurrentFrame + 1)
+    reason = unavailable
+    if not reason and (not confirmed or measurement.offset is None or source == 'yolo'):
+        reason = 'Skipped unverified alignment'
+    if not reason and (record is None or record.origin != 'pt' or 'reported_steps' not in record.settings):
+        reason = 'Skipped stop without PT telemetry'
+    if not reason:
+        settings = record.settings
+        gate = settings['steps'] + min(0, settings['extra_steps'])
+        if not settings['pt_valid']:
+            reason = 'Skipped invalid PT reading'
+        elif settings['reported_steps'] <= gate + 2:
+            reason = 'Skipped stop at minimum-step gate'
+    if reason:
+        fine_tuner.skip(reason)
         return
-    raw_height = CaptureResolution.split("x")[1].replace("*", "").strip()
-    if abs(offset_avg) < int(raw_height) * 0.005:
-        return  # Ignore if average offset is less than 0.5% of total height
-    direction = 1 if offset_avg > 0 else -1
-    step = min(10, int(abs(offset_avg)/10)) # big steps for big offsets
-    FrameFineTuneValue += int(direction * step)
-    if FrameFineTuneValue < 0:
-        FrameFineTuneValue = 0
-    elif FrameFineTuneValue > 100:
-        FrameFineTuneValue = 100
-    if PreviousFrameFineTuneValue != FrameFineTuneValue:
-        PreviousFrameFineTuneValue = FrameFineTuneValue
-        logging.debug(f"Average offset is {offset_avg}, adjusting fine tune value by {direction * step} to {FrameFineTuneValue}")
-        send_arduino_command(CMD_SET_FRAME_FINE_TUNE, FrameFineTuneValue)
-        frame_fine_tune_value.set(FrameFineTuneValue)
-    auto_fine_tune_wait = 2    # wait 5 frames to see the effect of this change
+    context = tuple((key, record.settings[key]) for key in
+                    ('film', 'steps', 'steps_auto', 'extra_steps', 'speed', 'vcenter', 'resolution', 'capstan'))
+    proposal = fine_tuner.observe(CurrentFrame + 1, 100 * measurement.offset / measurement.height,
+                                  FrameFineTuneValue, context, now=time.monotonic())
+    if proposal is None:
+        auto_fine_tune_limit_warned = fine_tuner.status.startswith('At limit')
+        return
+    # Stop may be requested by a save worker while the camera check is running.
+    if ScanStopRequested:
+        fine_tuner.skip('Scan stopping')
+        return
+    success = send_arduino_command(CMD_SET_FRAME_FINE_TUNE, proposal['value'])
+    fine_tuner.applied(proposal, success)
+    logging.info('Alignment tuning %s', json.dumps(dict(proposal, sent=success,
+                 settings=record.settings, run_id=alignment_statistics.run_id), sort_keys=True))
+    if success:
+        FrameFineTuneValue = PreviousFrameFineTuneValue = proposal['value']
+        ConfigData['FrameFineTune'] = FrameFineTuneValue
+        ConfigData['FrameFineTune' + FilmType] = FrameFineTuneValue
+        auto_fine_tune_limit_warned = False
+        if ExpertMode:
+            frame_fine_tune_value.set(FrameFineTuneValue)
+
+
+def record_alignment_arrival(measurement, confirmed=False, source=None):
+    source = source or measurement.source
+    added = alignment_statistics.arrival(CurrentFrame + 1, time.monotonic(),
+        None if measurement.offset is None else 100 * measurement.offset / measurement.height,
+        AlignmentGuardTolerance, confirmed, source)
+    if added and (confirmed or measurement.offset is None):
+        adjust_auto_fine_tune(measurement, confirmed, source)
+
+
+def check_arrival_feedback(measurement, decision, attempts_before):
+    """Return True only when an extra stationary tuning sample is needed."""
+    if attempts_before or alignment_guard.arrival_recorded:
+        return False
+    first = alignment_guard.arrival_first
+    if first is None:
+        alignment_guard.arrival_first = measurement
+        sample = (fine_tune_availability() is None and (CurrentFrame + 1) % 5 == 0
+                  and measurement.offset is not None and measurement.source != 'yolo')
+        if decision == 'confirm' or (decision == 'accept' and sample):
+            alignment_guard.arrival_waiting = True
+            return decision != 'confirm'
+        record_alignment_arrival(measurement)
+    else:
+        confirmed = (first.offset is not None and measurement.offset is not None
+                     and first.height == measurement.height
+                     and abs(first.offset - measurement.offset) <= measurement.height * .015)
+        source = 'yolo' if 'yolo' in (first.source, measurement.source) else measurement.source
+        original = HoleMeasurement((first.offset + measurement.offset) / 2 if confirmed else None,
+                                   measurement.height, source=source)
+        record_alignment_arrival(original, confirmed, source)
+    alignment_guard.arrival_recorded = True
+    alignment_guard.arrival_waiting = False
+    return False
 
 
 def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice_width=10):
@@ -1792,10 +1905,12 @@ def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice
     height = img.shape[0]
     width = img.shape[1]
 
-    # Slice only the left part of the image
-    if slice_width > width:
+    # Slice a strip at the left part of the image, but not at the very edge: the backlight can
+    # leave a shadow on the leftmost columns of the hole area which breaks or biases detection
+    slice_start = int(width * 0.04)
+    if slice_start + slice_width > width:
         raise ValueError("Slice width exceeds image width")
-    sliced_image = img[:, :slice_width]
+    sliced_image = img[:, slice_start:slice_start + slice_width]
 
     # Convert to grayscale
     img = cv2.cvtColor(sliced_image, cv2.COLOR_BGR2GRAY)
@@ -1849,6 +1964,8 @@ def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice
         area_count += 1
         if area_count > 2:
             break
+        if end-start > height*0.9:  # A single area spanning the whole strip is not a hole, skip it
+            continue
         if end-start > bigger:
             bigger = end-start
             center = int((start + end) // 2)
@@ -1859,7 +1976,7 @@ def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice
             return True, (result - middle) if result > middle else -(middle - result)
         else:
             return False, (result - middle) if result > middle else -(middle - result)
-    return False, -1
+    return False, None
 
 
 def reverse_image(image):
@@ -1935,20 +2052,17 @@ def capture_save_thread(queue, event, id):
                 request.save_dng(HdrFrameFilenamePattern % (frame_idx, hdr_idx, FileType))
             else:  # Non HDR
                 request.save_dng(FrameFilenamePattern % (frame_idx, FileType))                    
-                if DetectMisalignedFrames and can_check_dng_frames_for_misalignment:
+                if DetectMisalignedFrames:
                     captured_image = request.make_array('main')
             request.release()   # Release request ASAP (delay frame alignment check)
-            if DetectMisalignedFrames and can_check_dng_frames_for_misalignment and hdr_idx <= 1:
+            if DetectMisalignedFrames and hdr_idx <= 1:
                 frame_centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
-                offset_image.add_value(offset)
-                if AutoFineTuneEnabled:
-                    adjust_auto_fine_tune()
-                if not frame_centered:
+                if DetectMisalignedFrames and not frame_centered:
                     scan_error_counter += 1
                     if scan_error_total_frames_counter > 0:
                         scan_error_counter_value.set(f"{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)")
                     with open(scan_error_log_fullpath, 'a') as f:
-                        f.write(f"Misaligned frame, {CurrentFrame}\n")
+                        f.write(f"Misaligned frame, {frame_idx}\n")
             logging.debug("Thread %i saved request DNG image: %s ms", id,
                           str(round((time.time() - curtime) * 1000, 1)))
         else:
@@ -1978,16 +2092,18 @@ def capture_save_thread(queue, event, id):
                     captured_image = np.array(captured_image)
                 logging.debug("Thread %i saved image: %s ms", id,
                               str(round((time.time() - curtime) * 1000, 1)))
-            frame_centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
-            offset_image.add_value(offset)
-            if AutoFineTuneEnabled:
-                adjust_auto_fine_tune()
-            if DetectMisalignedFrames and hdr_idx <= 1 and not frame_centered:
-                scan_error_counter += 1
-                if scan_error_total_frames_counter > 0:
-                    scan_error_counter_value.set(f"{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)")
-                with open(scan_error_log_fullpath, 'a') as f:
-                    f.write(f"Misaligned frame, {CurrentFrame}\n")
+            # captured_image is only bound for whole-image (IMAGE_TOKEN) frames or when
+            # misalignment detection asked for the array (REQUEST_TOKEN path). Guard the
+            # check so PNG or HDR sub-frame scans with detection off do not dereference an
+            # unbound captured_image here. Alignment only applies to the base frame (hdr_idx <= 1).
+            if hdr_idx <= 1 and DetectMisalignedFrames:
+                frame_centered, offset = is_frame_centered(captured_image, FilmType, threshold=MisalignedFrameTolerance)
+                if DetectMisalignedFrames and not frame_centered:
+                    scan_error_counter += 1
+                    if scan_error_total_frames_counter > 0:
+                        scan_error_counter_value.set(f"{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)")
+                    with open(scan_error_log_fullpath, 'a') as f:
+                        f.write(f"Misaligned frame, {frame_idx}\n")
             logging.debug("Thread %i after checking misaligned frames", id)
         aux = time.time() - curtime
         total_wait_time_save_image += aux
@@ -2012,13 +2128,13 @@ def enable_canvas(canvas):
     # Re-enable other relevant events
 
 
-def draw_preview_image(preview_image, curframe, idx):
+def draw_preview_image(preview_image, curframe, idx, *, force=False):
     global total_wait_time_preview_display, PreviewModuleValue, preview_image_id_to_delete, IsSplashDisplayed, RealTimeZoom, ZoomSize, RealTimeDisplay
     global preview_image_id_to_delete, IsSplashDisplayed, FocusViewEnabled, ScanOngoing, FocusPeakingEnabled
 
     curtime = time.time()
 
-    if curframe % PreviewModuleValue == 0 and preview_image is not None:
+    if (force or curframe % PreviewModuleValue == 0) and preview_image is not None:
         if FocusViewEnabled and FocusPeakingEnabled and preview_image is not None:
             try:
                 img_rgb = preview_image.convert("RGB")
@@ -2311,7 +2427,7 @@ def cmd_set_s8():
 
     PTLevel = PTLevelS8
     FrameVCenterImageShift = FrameVCenterImageShiftS8
-    frame_vcenter_value.set(FrameVCenterImageShift)
+    if ExpertMode: frame_vcenter_value.set(FrameVCenterImageShift)
     MinFrameSteps = MinFrameStepsS8
     if ALT_scann_init_done:
         ConfigData["PTLevel"] = PTLevel
@@ -2337,7 +2453,7 @@ def cmd_set_r8():
 
     PTLevel = PTLevelR8
     FrameVCenterImageShift = FrameVCenterImageShiftR8
-    frame_vcenter_value.set(FrameVCenterImageShift)
+    if ExpertMode: frame_vcenter_value.set(FrameVCenterImageShift)
     MinFrameSteps = MinFrameStepsR8
     if ALT_scann_init_done:
         ConfigData["PTLevel"] = PTLevel
@@ -2426,8 +2542,8 @@ def adjust_hdr_bracket():
         logging.debug(f"Adjusting bracket, prev/cur exp: {PreviousCurrentExposure} -> {aux_current_exposure}")
         force_adjust_hdr_bracket = False
         PreviousCurrentExposure = aux_current_exposure
-        hdr_best_exp = aux_current_exposure
-        HdrMinExp = max(hdr_best_exp - int(HdrBracketWidth / 2), HdrMinExp)
+        hdr_best_exp = min(aux_current_exposure, HDR_MAX_EXP)
+        HdrMinExp = min(max(hdr_best_exp - int(HdrBracketWidth / 2), HdrMinExp), HDR_MAX_EXP - HdrBracketWidth)
         HdrMaxExp = HdrMinExp + HdrBracketWidth
         hdr_min_exp_value.set(HdrMinExp)
         hdr_max_exp_value.set(HdrMaxExp)
@@ -2478,7 +2594,7 @@ def capture_hdr(mode):
     is_dng = FileType == 'dng'
     is_png = FileType == 'png'
     for exp in work_list:
-        exp = max(1, exp + HdrBracketShift)  # Apply bracket shift
+        exp = min(max(1, exp + HdrBracketShift), HDR_MAX_EXP)  # Apply bracket shift
         logging.debug("capture_hdr: exp %.2f", exp)
         if perform_dry_run:
             camera.set_controls({"ExposureTime": int(exp * 1000)})
@@ -2554,6 +2670,621 @@ def capture_hdr(mode):
         img.save(FrameFilenamePattern % (CurrentFrame, FileType), quality=95)
 
 
+def set_alignment_status(message):
+    if alignment_status_var is not None:
+        alignment_status_var.set(message)
+
+
+def show_alignment_statistics():
+    global alignment_stats_window
+    if alignment_stats_window is not None and alignment_stats_window.winfo_exists():
+        alignment_stats_window.lift()
+        return
+    alignment_stats_window = AlignmentStatisticsWindow(win)
+    refresh_alignment_statistics()
+
+
+def refresh_alignment_statistics(force_log=False, reason='periodic'):
+    global alignment_stats_last_log, alignment_stats_logged_captures
+    now = time.monotonic()
+    snapshot = alignment_statistics.snapshot(now)
+    current = snapshot['recent']
+    unavailable = fine_tune_availability()
+    tuning = unavailable or fine_tuner.status
+    if alignment_stats_button_var is not None:
+        aligned = '—' if current['aligned_pct'] is None else f"{current['aligned_pct']:.0f}%"
+        fps = '—' if current['effective_fps'] is None else f"{current['effective_fps']:.2f}"
+        alignment_stats_button_var.set(f"Aligned {aligned} · corrected {current['corrections']}\n"
+                                       f"{fps} fps · Alignment statistics…")
+    if alignment_stats_window is not None and alignment_stats_window.winfo_exists():
+        alignment_stats_window.update_snapshot(snapshot, tuning,
+            f'Guard: {AlignmentGuardMode} · Tolerance: {AlignmentGuardTolerance:g}%'
+            + f' · PT: {"Auto" if AutoPtLevelEnabled else "Manual"} · Fine Tune: {FrameFineTuneValue}'
+            + f'\nSteps: {StepsPerFrame} ({"Auto" if AutoFrameStepsEnabled else "Manual"})')
+    captured = snapshot['session']['captured']
+    if alignment_statistics.started is not None and (force_log or (
+            snapshot['active'] and (now - alignment_stats_last_log >= 30
+                                   or captured - alignment_stats_logged_captures >= 100))):
+        snapshot.update(reason=reason, settings=alignment_settings(), tuning=tuning)
+        logging.info('Alignment statistics %s', json.dumps(snapshot, sort_keys=True))
+        alignment_stats_last_log = now
+        alignment_stats_logged_captures = captured
+
+
+def begin_alignment_statistics():
+    global alignment_stats_last_log, alignment_stats_logged_captures
+    alignment_statistics.start(time.monotonic())
+    fine_tuner.reset()
+    alignment_stats_last_log = 0
+    alignment_stats_logged_captures = 0
+    refresh_alignment_statistics(True, 'start')
+
+
+def cmd_alignment_guard(_event=None):
+    global AlignmentGuardMode, AlignmentGuardTolerance
+    if ScanOngoing and not alignment_paused:
+        alignment_guard_mode_var.set(AlignmentGuardMode)
+        alignment_guard_tolerance_var.set(str(AlignmentGuardTolerance))
+        return
+    AlignmentGuardMode = alignment_guard_mode_var.get()
+    try:
+        AlignmentGuardTolerance = max(0.5, min(10, float(alignment_guard_tolerance_var.get())))
+    except ValueError:
+        pass
+    alignment_guard_tolerance_var.set(str(AlignmentGuardTolerance))
+    ConfigData['AlignmentGuardMode'] = AlignmentGuardMode
+    ConfigData['AlignmentGuardTolerance'] = AlignmentGuardTolerance
+
+
+def release_alignment_request():
+    global alignment_request
+    if alignment_request is not None:
+        alignment_request.release()
+        alignment_request = None
+
+
+def reset_alignment_guard():
+    global alignment_guard, alignment_paused, alignment_pause_dialog, alignment_move_pending, alignment_move_result
+    global alignment_yolo_pending
+    global alignment_recovery, recovery_phase, recovery_pending, recovery_result, alignment_last_measurement
+    alignment_recovery = None
+    recovery_phase = None
+    recovery_pending = None
+    recovery_result = None
+    alignment_last_measurement = None
+    if alignment_yolo_pending is not None:
+        alignment_yolo_pending[0].release()
+        alignment_yolo_pending = None
+    alignment_move_pending = None
+    alignment_move_result = None
+    release_alignment_request()
+    alignment_guard = None
+    alignment_paused = False
+    if alignment_pause_dialog is not None:
+        alignment_pause_dialog.destroy()
+        alignment_pause_dialog = None
+
+
+def retry_alignment_frame():
+    if alignment_recovery is not None:
+        return
+    reset_alignment_guard()
+    set_alignment_status('Checking held frame')
+    win.after(5, capture_loop)
+
+
+def stop_alignment_scan():
+    stop_scan()
+    set_alignment_status(f'Stopped before frame {CurrentFrame + 1}; frame remains unsaved')
+
+
+def save_alignment_frame_and_stop():
+    save_alignment_frame(False)
+
+
+def save_alignment_frame_and_continue():
+    save_alignment_frame(True)
+
+
+def can_recover_alignment():
+    return (recovery_firmware_supported and FrameDetectMode == 'PFD' and FilmType == 'S8'
+            and alignment_recovery is None and alignment_last_measurement is not None
+            and alignment_last_measurement.offset is not None
+            and alignment_last_measurement.offset < -alignment_last_measurement.height * AlignmentGuardTolerance / 100)
+
+
+def save_alignment_frame_and_recover():
+    if can_recover_alignment():
+        save_alignment_frame(True, recover=True)
+
+
+def save_alignment_frame(continue_scan=False, recover=False):
+    """Accept this position once, using the normal filename and capture path."""
+    global CurrentFrame, CurrentStill, session_frames, FramesToGo
+    global NewFrameAvailable, RetryingFrame, ScanStopRequested
+    global last_frame_time
+    if not ScanOngoing or not alignment_paused or alignment_recovery is not None:
+        return
+    previous_frame = CurrentFrame
+    CurrentFrame += 1
+    session_frames += 1  # HDR exposure order must match the normal scan path.
+    CurrentStill = 1
+    try:
+        # Keep the scan paused (and UV on) until all required exposures are taken.
+        # The regular save workers retain ownership of queued camera requests.
+        capture('normal')
+    except Exception as error:
+        CurrentFrame = previous_frame
+        session_frames -= 1
+        ConfigData['CurrentFrame'] = str(CurrentFrame)
+        logging.exception('Failed to capture held frame %s', CurrentFrame + 1)
+        set_alignment_status(f'Capture failed; film still held: {error}')
+        tk.messagebox.showerror('Capture failed',
+                                'The film is still held. Check the output files before retrying.\n'
+                                + str(error))
+        return
+    alignment_statistics.frame(CurrentFrame, time.monotonic()).accepted_as_is = True
+    register_frame()
+    remaining = frames_to_go_str.get()
+    if remaining.isdigit() and int(remaining) > 0:
+        FramesToGo = int(remaining) - 1
+        frames_to_go_str.set(str(FramesToGo))
+        ConfigData['FramesToGo'] = FramesToGo
+    ConfigData['CurrentDate'] = str(datetime.now())
+    ConfigData['CurrentDir'] = CurrentDir
+    ConfigData['CurrentFrame'] = str(CurrentFrame)
+    Scanned_Images_number.set(CurrentFrame)
+    fps = 18 if FilmType == 'S8' else 16
+    scanned_Images_time_value.set(f'{(CurrentFrame // fps) // 60:02}:{(CurrentFrame // fps) % 60:02}')
+    NewFrameAvailable = False
+    RetryingFrame = False
+    counter_finished = (remaining.isdigit() and int(remaining) <= 1
+                        and AutoStopEnabled and autostop_type.get() == 'counter_to_zero')
+    if continue_scan and not counter_finished and not ScanStopRequested:
+        # A manual pause can outlast the watchdog. Give the next advance a
+        # fresh interval before exposing an unpaused, guard-free scan state.
+        last_frame_time = time.time() + max_inactivity_delay - 2
+        reset_alignment_guard()
+        if recover:
+            start_alignment_recovery()
+            return
+        # The regular I2C retry path advances an already captured frame without
+        # saving/counting it again, including when the first send fails.
+        NewFrameAvailable = True
+        RetryingFrame = True
+        logging.info('Accepted held frame %s manually; continuing scan', CurrentFrame)
+        set_alignment_status(f'Frame {CurrentFrame} captured; continuing')
+        win.after(5, capture_loop)
+        return
+    logging.info('Accepted held frame %s manually; stopping without advancing', CurrentFrame)
+    stop_scan()
+    ScanStopRequested = False
+    set_alignment_status(f'Frame {CurrentFrame} captured for normal saving; stopped without advancing')
+
+
+def pause_alignment_frame(reason, image=None):
+    global alignment_paused, alignment_pause_dialog
+    release_alignment_request()
+    alignment_paused = True
+    record = alignment_statistics.frame(CurrentFrame + 1, time.monotonic())
+    record.paused = True
+    if record.arrival == 'unmeasured':
+        record_alignment_arrival(HoleMeasurement(None, 1, reason))
+    filename = FrameFilenamePattern % (CurrentFrame + 1, FileType)
+    logging.warning('Alignment paused before %s: %s', filename, reason)
+    with open(scan_error_log_fullpath, 'a') as log:
+        log.write(f'Alignment paused, {CurrentFrame + 1}, {filename}, {reason}\n')
+    set_alignment_status(f'Paused before frame {CurrentFrame + 1}: {reason}')
+    if image is not None:
+        draw_preview_image(image, CurrentFrame + 1, 0)
+    alignment_pause_dialog = tk.Toplevel(win)
+    alignment_pause_dialog.title('Alignment paused')
+    alignment_pause_dialog.transient(win)
+    tk.Label(alignment_pause_dialog, text=(
+        f'{filename} has not been saved. The film is held at this frame.\n\n{reason}\n\n'
+        'Retry checks the same frame. Save uses the normal scan filename.\n'
+        'Choose whether to continue scanning or stop with the film held.'), padx=16, pady=16).pack()
+    if can_recover_alignment():
+        tk.Label(alignment_pause_dialog, text=(
+            'Save and find next frame keeps this image as-is, then aligns the following frame.'),
+            wraplength=650).pack()
+        tk.Button(alignment_pause_dialog, text='Save and find next frame',
+                  command=save_alignment_frame_and_recover).pack(pady=8)
+    tk.Button(alignment_pause_dialog, text='Retry this frame', command=retry_alignment_frame).pack(side=LEFT, padx=16, pady=12)
+    tk.Button(alignment_pause_dialog, text='Save and continue', command=save_alignment_frame_and_continue).pack(side=LEFT, padx=8, pady=12)
+    tk.Button(alignment_pause_dialog, text='Save this frame and stop', command=save_alignment_frame_and_stop).pack(side=LEFT, padx=8, pady=12)
+    tk.Button(alignment_pause_dialog, text='Stop without saving', command=stop_alignment_scan).pack(side=RIGHT, padx=16, pady=12)
+    alignment_pause_dialog.protocol('WM_DELETE_WINDOW', stop_alignment_scan)
+
+
+def receive_alignment_response(payload, moved):
+    global alignment_firmware_supported, alignment_move_result
+    global recovery_firmware_supported
+    if payload == 0:
+        alignment_firmware_supported = Controller_Id == 1 and moved == 1
+        recovery_firmware_supported = False
+        if alignment_firmware_supported:
+            send_arduino_command(CMD_ALIGN_FRAME, 32767)
+        set_alignment_status('Ready: automatic correction available' if alignment_firmware_supported
+                             else 'Correction unavailable; pause protection active')
+    elif payload == 32767:
+        recovery_firmware_supported = Controller_Id == 1 and moved == 2
+        logging.info('Forward recovery support: %s', recovery_firmware_supported)
+    elif alignment_move_pending is not None and payload == alignment_move_pending[0]:
+        logging.info('Alignment nudge ack frame=%i token=%i requested_steps=%i reported_steps=%i',
+                     CurrentFrame + 1, payload >> 8, payload & 255, moved)
+        alignment_move_result = moved
+    else:
+        logging.warning('Ignoring stale alignment acknowledgement %i', payload)
+
+
+def send_alignment_nudge(steps):
+    global alignment_move_pending, alignment_move_result, alignment_move_token
+    if not alignment_firmware_supported or not 1 <= steps <= 40:
+        return False
+    alignment_move_token = alignment_move_token % 127 + 1
+    payload = alignment_move_token * 256 + steps
+    alignment_move_result = None
+    alignment_move_pending = (payload, time.monotonic() + 3)
+    logging.info('Alignment nudge send frame=%i token=%i steps=%i',
+                 CurrentFrame + 1, alignment_move_token, steps)
+    set_alignment_status(f'Correcting frame {CurrentFrame + 1}: {steps} steps')
+    if not send_arduino_command(CMD_ALIGN_FRAME, payload):
+        logging.warning('Alignment nudge send failed frame=%i token=%i steps=%i',
+                        CurrentFrame + 1, alignment_move_token, steps)
+        alignment_move_pending = None
+        return False
+    return True
+
+
+def prepare_alignment_frame():
+    """Check the stationary frame before changing counters, saving, or advancing.
+
+    Runs on the Tk scan loop, so feedback is ordered and never races an advance
+    from a background save thread. A checked request is reused for normal capture.
+    """
+    global alignment_guard, alignment_request, CaptureSettleDeadline
+    global alignment_move_pending, alignment_move_result
+    global alignment_yolo_pending
+    global alignment_last_measurement
+    if SimulatedRun or CameraDisabled:
+        return True
+    if AlignmentGuardMode == 'Off' and fine_tune_availability() is not None:
+        return True
+    if alignment_guard is None:
+        alignment_guard = AlignmentGuard(AlignmentGuardTolerance,
+            correct=AlignmentGuardMode == 'Correct' and alignment_firmware_supported and FilmType == 'S8',
+            steps_per_frame=FrameStepsS8 if FilmType == 'S8' else FrameStepsR8)
+        CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME) + StabilizationDelayValue / 1000
+    if alignment_move_pending is not None:
+        payload, deadline = alignment_move_pending
+        if alignment_move_result is None:
+            if time.monotonic() > deadline:
+                logging.warning('Alignment nudge timeout frame=%i token=%i requested_steps=%i',
+                                CurrentFrame + 1, payload >> 8, payload & 255)
+                alignment_move_pending = None
+                pause_alignment_frame('Timed out waiting for corrective movement; command will not be repeated')
+            return False
+        moved = alignment_move_result
+        alignment_move_pending = None
+        alignment_move_result = None
+        if moved != (payload & 255):
+            pause_alignment_frame('Controller refused corrective movement')
+            return False
+        record = alignment_statistics.frame(CurrentFrame + 1, time.monotonic())
+        record.nudges += 1
+        record.nudge_steps += moved
+        CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME) + StabilizationDelayValue / 1000
+    request = None
+    try:
+        if alignment_yolo_pending is not None:
+            held, future, deadline, height = alignment_yolo_pending
+            if not future.done() and time.monotonic() < deadline:
+                return False
+            request = held
+            alignment_yolo_pending = None
+            measurement = (future.result() if future.done() else
+                           HoleMeasurement(None, height, 'YOLO timed out; film remains held', 'yolo'))
+        else:
+            request = capture_settled_request()
+            metadata = request.get_metadata()
+            exposure_start = (metadata['SensorTimestamp'] - metadata['ExposureTime'] * 1000) / 1e9
+            if exposure_start < CaptureSettleDeadline:
+                pause_alignment_frame('Camera did not provide a settled exposure')
+                return False
+            image = request.make_array('main')
+            height = image.shape[0]
+            shift = FrameVCenterImageShift * height / PreviewHeight if PreviewHeight > 0 else FrameVCenterImageShift
+            measurement = measure_hole(image, FilmType, shift)
+            if measurement.offset is None and AlignmentGuardMode != 'Off':
+                logging.info('Alignment fallback frame=%i source=%s reason=%s',
+                             CurrentFrame + 1, measurement.source, measurement.reason)
+                # PIL normalizes the camera stream format to RGB. Inference
+                # runs on an owned copy while Tk keeps responding to Stop.
+                rgb = np.asarray(request.make_image('main').convert('RGB'))
+                future = alignment_yolo_worker.submit(rgb, FilmType, shift)
+                if future is None:
+                    pause_alignment_frame('YOLO is still busy; film remains held')
+                    return False
+                alignment_yolo_pending = (request, future, time.monotonic() + 10, height)
+                request = None
+                set_alignment_status(f'Checking damaged sprocket on frame {CurrentFrame + 1}')
+                return False
+        stage = ('after_nudge' if alignment_guard.attempts else
+                 'confirmation' if alignment_guard.confirming or alignment_guard.arrival_waiting else 'initial')
+        alignment_last_measurement = measurement
+        metadata = request.get_metadata()  # Metadata of this request; no extra exposure.
+        logging.info('Alignment measurement frame=%i stage=%s nudge=%i offset_px=%s '
+                     'offset_pct=%s height_px=%i source=%s sensor_timestamp_ns=%s '
+                     'exposure_us=%s reason=%s',
+                     CurrentFrame + 1, stage, alignment_guard.attempts, measurement.offset,
+                     None if measurement.offset is None else round(100 * measurement.offset / height, 3),
+                     height, measurement.source, metadata.get('SensorTimestamp'),
+                     metadata.get('ExposureTime'), measurement.reason)
+        if alignment_guard.attempts:
+            # Log before inspect() can replace last_offset/next_steps with the
+            # starting point and size of another corrective move.
+            logging.info('Alignment nudge result frame=%i nudge=%i requested_steps=%i '
+                         'before_px=%s after_px=%s improvement_px=%s',
+                         CurrentFrame + 1, alignment_guard.attempts, alignment_guard.next_steps,
+                         alignment_guard.last_offset, measurement.offset,
+                         None if measurement.offset is None or alignment_guard.last_offset is None
+                         else alignment_guard.last_offset - measurement.offset)
+        attempts_before = alignment_guard.attempts
+        decision = 'accept' if AlignmentGuardMode == 'Off' else alignment_guard.inspect(measurement)
+        if check_arrival_feedback(measurement, decision, attempts_before):
+            CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME)
+            set_alignment_status('Verifying Fine Tune sample')
+            return False
+        if decision in ('confirm', 'nudge') or alignment_guard.attempts:
+            # Show the checked position before movement and after every nudge,
+            # including the final accepted position, without another exposure.
+            draw_preview_image(request.make_image('main'), CurrentFrame + 1, 0, force=True)
+        if decision == 'accept':
+            if alignment_guard.attempts:
+                logging.info('Alignment corrected before frame %i: %i steps in %i attempts, residual %.1f px',
+                    CurrentFrame + 1, alignment_guard.total_steps, alignment_guard.attempts, measurement.offset)
+            alignment_request = request
+            request = None  # Ownership transfers to capture_single / capture_hdr.
+            alignment_guard = None
+            if measurement.offset is None:
+                set_alignment_status('Hole not found; auto fine tune has no feedback')
+            else:
+                status = f'Offset {100 * measurement.offset / height:+.1f}%'
+                if measurement.source != 'strips':
+                    status += f' ({measurement.source})'
+                if AlignmentGuardMode == 'Correct' and not alignment_firmware_supported:
+                    status += '; pause protection only'
+                if AutoFineTuneEnabled and auto_fine_tune_limit_warned:
+                    status += f'; Fine Tune at limit {FrameFineTuneValue}'
+                set_alignment_status(status)
+            return True
+        if decision == 'confirm':
+            # Require another exposure of this same physical frame, not another film frame.
+            CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME)
+            set_alignment_status('Confirming alignment')
+            return False
+        if decision == 'nudge':
+            logging.info('Alignment nudge planned frame=%i nudge=%i steps=%i before_px=%s height_px=%i',
+                         CurrentFrame + 1, alignment_guard.attempts, alignment_guard.next_steps,
+                         measurement.offset, height)
+            request.release()
+            request = None
+            if not send_alignment_nudge(alignment_guard.next_steps):
+                pause_alignment_frame('Could not send corrective movement; command will not be repeated')
+            return False
+        reason = alignment_guard.reason or measurement.reason or f'Offset {100 * measurement.offset / height:+.1f}% exceeds {AlignmentGuardTolerance:g}%'
+        if measurement.offset is not None and alignment_guard.reason:
+            reason += f' (offset {100 * measurement.offset / height:+.1f}%, tolerance {AlignmentGuardTolerance:g}%)'
+        if AlignmentGuardMode == 'Correct' and not alignment_firmware_supported:
+            reason += '. Automatic correction requires the Nano alignment firmware update'
+        pause_alignment_frame(reason, request.make_image('main'))
+        return False
+    except (RuntimeError, KeyError, ValueError, cv2.error) as error:
+        logging.exception('Cannot verify stationary frame')
+        pause_alignment_frame(f'Could not verify frame: {error}')
+        return False
+    finally:
+        if request is not None:
+            request.release()
+
+
+def send_recovery_command(parameter):
+    """One outstanding command; an uncertain send is never repeated."""
+    global recovery_pending, recovery_result
+    if not ScanOngoing or ScanStopRequested:
+        return False
+    recovery_result = None
+    recovery_pending = (parameter, time.monotonic() + 3)
+    logging.info('Recovery send next_frame=%i parameter=%i', CurrentFrame + 1, parameter)
+    if not send_arduino_command(CMD_ADVANCE_FRAME_FRACTION, parameter):
+        recovery_pending = None
+        pause_alignment_recovery('Movement command delivery is uncertain; it will not be repeated')
+        return False
+    return True
+
+
+def receive_recovery_response(parameter, status):
+    global recovery_result
+    if recovery_pending is None or parameter != recovery_pending[0]:
+        logging.warning('Ignoring unexpected recovery acknowledgement parameter=%i status=%i', parameter, status)
+        return
+    logging.info('Recovery ack next_frame=%i parameter=%i status=%i', CurrentFrame + 1, parameter, status)
+    recovery_result = status
+
+
+def start_alignment_recovery():
+    global alignment_recovery, recovery_phase, recovery_deadline
+    global NewFrameAvailable, RetryingFrame
+    alignment_recovery = ForwardRecovery(FrameStepsS8, AlignmentGuardTolerance)
+    recovery_phase = 'enter'
+    recovery_deadline = time.monotonic() + 90
+    NewFrameAvailable = False
+    RetryingFrame = False
+    fine_tuner.reset()
+    record = alignment_statistics.frame(CurrentFrame + 1, time.monotonic(), origin='recovery', settings=alignment_settings())
+    record.recovery_started = True
+    logging.info('Recovery starting after saved partial frame=%i; seeking next_frame=%i', CurrentFrame, CurrentFrame + 1)
+    set_alignment_status(f'Finding frame {CurrentFrame + 1}; frame {CurrentFrame} saved as-is')
+    if send_recovery_command(401):
+        win.after(5, capture_loop)
+
+
+def pause_alignment_recovery(reason):
+    """No save/retry shortcut: the film may be between numbered frames."""
+    global alignment_paused, recovery_phase, recovery_pending, alignment_pause_dialog
+    recovery_phase = 'failed'
+    recovery_pending = None
+    release_alignment_request()
+    alignment_paused = True
+    alignment_statistics.frame(CurrentFrame + 1, time.monotonic()).recovery_failed = True
+    logging.warning('Recovery stopped after frame=%i total_steps=%i: %s',
+                    CurrentFrame, alignment_recovery.total_steps, reason)
+    set_alignment_status(f'Recovery stopped: {reason}')
+    if alignment_pause_dialog is not None:
+        alignment_pause_dialog.destroy()
+    alignment_pause_dialog = tk.Toplevel(win)
+    alignment_pause_dialog.title('Recovery stopped')
+    alignment_pause_dialog.transient(win)
+    tk.Label(alignment_pause_dialog, text=(
+        f'Frame {CurrentFrame} was saved as-is. Frame {CurrentFrame + 1} has not been saved.\n'
+        f'{reason}\n\nThe film may be between frames. Stop and inspect its position before restarting.'),
+        padx=16, pady=16).pack()
+    tk.Button(alignment_pause_dialog, text='Stop', command=stop_alignment_scan).pack(pady=12)
+    alignment_pause_dialog.protocol('WM_DELETE_WINDOW', stop_alignment_scan)
+
+
+def prepare_recovery_frame():
+    """Advance/check on the Tk loop, then hand the verified next exposure to capture."""
+    global recovery_pending, recovery_result, recovery_phase, alignment_recovery
+    global CaptureSettleDeadline, alignment_request, last_frame_time
+    if time.monotonic() > recovery_deadline:
+        pause_alignment_recovery('Recovery exceeded 90 seconds')
+        return False
+    if recovery_pending is not None:
+        parameter, deadline = recovery_pending
+        if recovery_result is None:
+            if time.monotonic() > deadline:
+                pause_alignment_recovery('Timed out waiting for movement acknowledgement; command will not be repeated')
+            return False
+        status = recovery_result
+        recovery_pending = None
+        recovery_result = None
+        if status != 1:
+            pause_alignment_recovery('Controller refused the recovery command')
+            return False
+        if recovery_phase == 'leave':
+            alignment_statistics.frame(CurrentFrame + 1, time.monotonic()).recovered = True
+            logging.info('Recovery complete next_frame=%i total_steps=%i moves=%i',
+                         CurrentFrame + 1, alignment_recovery.total_steps, alignment_recovery.moves)
+            alignment_recovery = None
+            recovery_phase = None
+            last_frame_time = time.time() + max_inactivity_delay - 2
+            set_alignment_status(f'Frame {CurrentFrame + 1} aligned; resuming normal scan')
+            return True
+        if recovery_phase == 'move':
+            alignment_recovery.moved(parameter)
+            alignment_statistics.frame(CurrentFrame + 1, time.monotonic()).recovery_steps += parameter
+        recovery_phase = 'measure'
+        CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME) + StabilizationDelayValue / 1000
+    request = None
+    try:
+        request = capture_settled_request()
+        metadata = request.get_metadata()
+        exposure_start = (metadata['SensorTimestamp'] - metadata['ExposureTime'] * 1000) / 1e9
+        if exposure_start < CaptureSettleDeadline:
+            pause_alignment_recovery('Camera did not provide a settled exposure')
+            return False
+        image = request.make_array('main')
+        height = image.shape[0]
+        shift = FrameVCenterImageShift * height / PreviewHeight if PreviewHeight > 0 else FrameVCenterImageShift
+        measurement = measure_hole(image, FilmType, shift)
+        if ScanStopRequested:
+            return False
+        decision = alignment_recovery.inspect(measurement, target_shift=shift)
+        # Show the same settled exposure used for tracking, even when normal
+        # previews are configured to skip frames. No additional camera capture.
+        draw_preview_image(request.make_image('main'), CurrentFrame + 1, 0, force=True)
+        offset_status = ('checking sprocket' if measurement.offset is None else
+                         f'offset {100 * measurement.offset / height:+.1f}%')
+        set_alignment_status(f'Finding frame {CurrentFrame + 1}: '
+                             f'{alignment_recovery.total_steps} steps; {offset_status}')
+        logging.info('Recovery measurement next_frame=%i phase=%s steps=%i offset_px=%s '
+                     'height_px=%i source=%s decision=%s reason=%s sensor_timestamp_ns=%s',
+                     CurrentFrame + 1, alignment_recovery.phase, alignment_recovery.total_steps,
+                     measurement.offset, height, measurement.source, decision,
+                     alignment_recovery.reason or measurement.reason, metadata.get('SensorTimestamp'))
+        if decision == 'confirm':
+            CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME)
+        elif decision == 'move':
+            request.release()
+            request = None
+            recovery_phase = 'move'
+            send_recovery_command(alignment_recovery.next_steps)
+        elif decision == 'accept':
+            alignment_request = request
+            request = None
+            recovery_phase = 'leave'
+            send_recovery_command(402)
+        else:
+            pause_alignment_recovery(alignment_recovery.reason)
+    except (RuntimeError, KeyError, ValueError, cv2.error) as error:
+        logging.exception('Cannot verify recovery position')
+        pause_alignment_recovery(f'Could not verify recovery position: {error}')
+    finally:
+        if request is not None:
+            request.release()
+    return False
+
+
+def take_alignment_request():
+    global alignment_request
+    if alignment_request is not None:
+        request, alignment_request = alignment_request, None
+        return request
+    return capture_settled_request()
+
+
+def take_alignment_image():
+    if alignment_request is None:
+        return camera.capture_image('main')
+    request = take_alignment_request()
+    try:
+        return request.make_image('main')
+    finally:
+        request.release()
+
+
+def capture_settled_request():
+    # With queue=False the frame returned by capture_request may have started
+    # exposure up to one frame period before the request, i.e. before the
+    # stabilization delay elapsed, while the film was still settling. With a
+    # rolling shutter that shows as vertical stretch/compression of the frame.
+    # Discard frames whose exposure began before the settle deadline.
+    rejected = 0
+    while True:
+        request = camera.capture_request()
+        metadata = request.get_metadata()
+        exposure_start = (metadata['SensorTimestamp'] - metadata['ExposureTime'] * 1000) / 1e9
+        if exposure_start >= CaptureSettleDeadline:
+            if rejected:
+                logging.debug(f"Settle guard: discarded {rejected} early frame(s) for frame {CurrentFrame}")
+            return request
+        # Give up only once waiting longer cannot help: with the sensor free-running,
+        # a frame exposed after the deadline must complete within about two frame
+        # periods past it. A fixed rejection count fails open with long exposures
+        # (frame period grows with exposure time), capturing before the film settled.
+        frame_period = metadata.get('FrameDuration', 100000) / 1e6
+        if time.clock_gettime(time.CLOCK_BOOTTIME) > CaptureSettleDeadline + 2 * frame_period + 0.25:
+            logging.warning(
+                f"Settle guard: giving up for frame {CurrentFrame} after {rejected} early frames "
+                f"(exposure_start-deadline={round((exposure_start - CaptureSettleDeadline) * 1000)} ms, "
+                f"ExposureTime={metadata['ExposureTime']} us, FrameDuration={metadata['FrameDuration']} us)")
+            return request
+        request.release()
+        rejected += 1
+
+
 def capture_single(mode):
     global CurrentFrame
     global total_wait_time_save_image, PreviewModuleValue
@@ -2568,7 +3299,7 @@ def capture_single(mode):
     curtime = time.time()
     if not DisableThreads:
         if is_dng or is_png:  # Save as request only for DNG captures
-            request = camera.capture_request()
+            request = take_alignment_request()
             # For PiCamera2, preview and save to file are handled in asynchronous threads
             if CurrentFrame % PreviewModuleValue == 0:
                 captured_image = request.make_image('main')
@@ -2582,7 +3313,7 @@ def capture_single(mode):
                 capture_save_queue.put(save_queue_item)
                 logging.debug(f"Queueing frame ({CurrentFrame}")
         else:
-            captured_image = camera.capture_image("main")
+            captured_image = take_alignment_image()
             if NegativeImage:
                 captured_image = reverse_image(captured_image)
             queue_item = tuple((IMAGE_TOKEN, captured_image, CurrentFrame, 0))
@@ -2601,7 +3332,7 @@ def capture_single(mode):
             Scanned_Images_number.set(CurrentFrame)
     else:
         if is_dng or is_png:
-            request = camera.capture_request()
+            request = take_alignment_request()
             if CurrentFrame % PreviewModuleValue == 0:
                 captured_image = request.make_image('main')
             else:
@@ -2612,7 +3343,7 @@ def capture_single(mode):
                 logging.debug(f"Saving DNG frame ({CurrentFrame}: {round((time.time() - curtime) * 1000, 1)}")
             request.release()
         else:
-            captured_image = camera.capture_image("main")
+            captured_image = take_alignment_image()
             if NegativeImage:
                 captured_image = reverse_image(captured_image)
             draw_preview_image(captured_image, CurrentFrame, 0)
@@ -2638,9 +3369,19 @@ def capture(mode):
     global PreviousGainRed, PreviousGainBlue
     global total_wait_time_autoexp, total_wait_time_awb
     global CurrentStill
+    global CaptureSettleDeadline
 
     if SimulatedRun or CameraDisabled:
         return
+
+    # If exposure adaptation is requested, retain its existing wait semantics.
+    # The preflight still verifies position; the transport stays stationary.
+    if PiCam2PreviewEnabled or (ExposureWbAdaptPause and (AutoExpEnabled or AutoWbEnabled)):
+        release_alignment_request()
+    # Film transport has just stopped; frames exposed before this deadline may
+    # be distorted by the rolling shutter (SensorTimestamp uses CLOCK_BOOTTIME)
+    if alignment_request is None:
+        CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME) + StabilizationDelayValue / 1000
 
     os.chdir(CurrentDir)
 
@@ -2651,7 +3392,12 @@ def capture(mode):
         curtime = time.time()
         wait_loop_count = 0
         while True:  # In case of exposure change, give time for the camera to adapt
-            metadata = camera.capture_metadata()
+            if ExposureWbAdaptPause or LastCameraMetadata is None:
+                metadata = camera.capture_metadata()
+            else:
+                # Not waiting for a match: the cached metadata from the last
+                # completed frame is enough, no need to block for a new one
+                metadata = LastCameraMetadata
             aux_current_exposure = metadata["ExposureTime"]
             if ExposureWbAdaptPause:
                 # With PiCamera2, exposure was changing too often, so level changed from 1000 to 2000, then to 4000
@@ -2687,7 +3433,10 @@ def capture(mode):
         curtime = time.time()
         wait_loop_count = 0
         while True:  # In case of exposure change, give time for the camera to adapt
-            metadata = camera.capture_metadata()
+            if ExposureWbAdaptPause or LastCameraMetadata is None:
+                metadata = camera.capture_metadata()
+            else:
+                metadata = LastCameraMetadata
             camera_colour_gains = metadata["ColourGains"]
             aux_gain_red = camera_colour_gains[0]
             aux_gain_blue = camera_colour_gains[1]
@@ -2729,13 +3478,18 @@ def capture(mode):
             camera.switch_mode_and_capture_file(capture_config, FrameFilenamePattern % CurrentFrame)
     else:
         # Allow time to stabilize image, it can get too fast with PiCamera2
-        time.sleep(StabilizationDelayValue/1000)
+        # DNG/PNG captures skip the fixed sleep: capture_settled_request waits
+        # for a frame exposed after the deadline instead, which both guarantees
+        # the settle time and starts the capture as early as possible
+        if mode == 'still' or HdrCaptureActive or FileType not in ('dng', 'png'):
+            time.sleep(StabilizationDelayValue/1000)
         if mode == 'still':
             captured_image = camera.capture_image("main")
             captured_image.save(StillFrameFilenamePattern % (CurrentFrame, CurrentStill))
             CurrentStill += 1
         else:
             if HdrCaptureActive:
+                release_alignment_request()
                 # Stabilization delay for HDR managed inside capture_hdr
                 capture_hdr(mode)
             else:
@@ -2743,6 +3497,8 @@ def capture(mode):
 
     ConfigData["CurrentDate"] = str(datetime.now())
     ConfigData["CurrentFrame"] = str(CurrentFrame)
+    if mode == 'normal' and ScanOngoing:
+        alignment_statistics.captured(CurrentFrame, time.monotonic())
 
 def simulate_pt():
     global Simulated_PT_Levels_idx, Simulated_Frame_detected, Simulated_Frame_displayed
@@ -2856,6 +3612,7 @@ def stop_scan_simulated():
     start_btn.config(text="START Scan", bg=save_bg, fg=save_fg, relief=RAISED)
 
     ScanOngoing = False
+    reset_alignment_guard()
     custom_spinboxes_kbd_lock(win)
 
     # Enable/Disable related buttons
@@ -2961,7 +3718,7 @@ def start_scan():
     global ScanOngoing
     global CurrentScanStartFrame, CurrentScanStartTime
     global ScanStopRequested
-    global NewFrameAvailable
+    global NewFrameAvailable, RetryingFrame
     global total_wait_time_autoexp, total_wait_time_awb, total_wait_time_preview_display, session_start_time
     global total_wait_time_save_image
     global session_frames
@@ -3005,6 +3762,12 @@ def start_scan():
         # Set new frame indicator to false, in case this is the cause of the strange
         # behaviour after stopping/restarting the scan process
         NewFrameAvailable = False
+        reset_alignment_guard()
+        begin_alignment_statistics()
+        # Clear any stop/retry request left over from a previous (or aborted) scan, so a
+        # stale flag cannot immediately stop this one on the first capture_loop iteration.
+        ScanStopRequested = False
+        RetryingFrame = False
 
         # Enable/Disable related buttons
         except_widget_global_enable([start_btn], not ScanOngoing)
@@ -3039,7 +3802,12 @@ def stop_scan():
     if ScanOngoing:  # Scanner session to be stopped
         start_btn.config(text="START Scan", bg=save_bg, fg=save_fg, relief=RAISED)
 
+    if alignment_recovery is not None:
+        alignment_statistics.frame(CurrentFrame + 1, time.monotonic()).recovery_failed = True
+    alignment_statistics.stop(time.monotonic())
+    refresh_alignment_statistics(True, 'stop')
     ScanOngoing = False
+    reset_alignment_guard()
     custom_spinboxes_kbd_lock(win)
 
     # Send command to Arduino to stop scan (as applicable, Arduino keeps its own status)
@@ -3055,7 +3823,7 @@ def capture_loop():
     global win
     global CurrentFrame
     global FramesPerMinute, FramesToGo
-    global NewFrameAvailable
+    global NewFrameAvailable, RetryingFrame
     global ScanProcessError, ScanProcessError_LastTime
     global ScanStopRequested
     global session_frames, CurrentStill
@@ -3093,6 +3861,18 @@ def capture_loop():
                                       "Please delete some files before continuing current scan.")
             disk_space_error_to_notify = False
     elif ScanOngoing:
+        if alignment_paused:
+            return
+        recovered_frame_ready = False
+        if alignment_recovery is not None:
+            if not prepare_recovery_frame():
+                if not alignment_paused:
+                    win.after(10, capture_loop)
+                return
+            recovered_frame_ready = True
+            NewFrameAvailable = True
+            scan_error_total_frames_counter += 1
+            scan_error_counter_value.set(f'{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)')
         if FrameDetectMode == 'VFD':
             # If we are in Visual Frame Detection mode, we need to:
             #   - Capture a snap
@@ -3116,6 +3896,11 @@ def capture_loop():
             image_np = np.array(sample_image)  # PIL gives RGB by default
             image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR
             centered, offset = is_frame_centered(image_bgr, FilmType, threshold=MisalignedFrameTolerance)
+            if offset is None:
+                logging.warning("VFD: no sprocket detected; stopping before advancing")
+                ScanStopRequested = True
+                win.after(5, capture_loop)
+                return
             img_height = sample_image.size[1]
             pixels_per_step = img_height // (FrameStepsS8 if FilmType == 'S8' else FrameStepsR8)   # Height divided by number of steps = pixels per step
             vfd_CurrentFrame_previous = CurrentFrame
@@ -3161,38 +3946,56 @@ def capture_loop():
                 vfd_attempts_on_same_frame = 0
             # If centered, or gone too far, or offset too small to handle, let the code flow in the standard flow to do the normal capture
         if NewFrameAvailable:
-            # Update remaining time
-            aux = frames_to_go_str.get()
-            if aux.isdigit() and time.time() > frames_to_go_key_press_time:
-                FramesToGo = int(aux)
-                if FramesToGo > 0:
-                    FramesToGo -= 1
-                    frames_to_go_str.set(str(FramesToGo))
-                    ConfigData["FramesToGo"] = FramesToGo
-                    if FramesPerMinute != 0:
-                        minutes_pending = FramesToGo // FramesPerMinute
-                        frames_to_go_time_str.set(f"{(minutes_pending // 60):02}h {(minutes_pending % 60):02}m")
-                else:
-                    if AutoStopEnabled and autostop_type.get() == "counter_to_zero":
-                        ScanStopRequested = True  # Stop in next capture loop
-                    ConfigData["FramesToGo"] = -1
-                    frames_to_go_str.set('')  # clear frames to go box to prevent it stops again in next scan
-            CurrentFrame += 1
-            session_frames += 1
-            register_frame()
-            CurrentStill = 1
-            capture('normal')
+            if not RetryingFrame:
+                if FrameDetectMode == 'PFD' and not recovered_frame_ready and not prepare_alignment_frame():
+                    if not alignment_paused:
+                        win.after(10, capture_loop)
+                    return
+                # Update remaining time
+                aux = frames_to_go_str.get()
+                if aux.isdigit() and time.time() > frames_to_go_key_press_time:
+                    FramesToGo = int(aux)
+                    if FramesToGo > 0:
+                        FramesToGo -= 1
+                        frames_to_go_str.set(str(FramesToGo))
+                        ConfigData["FramesToGo"] = FramesToGo
+                        if FramesPerMinute != 0:
+                            minutes_pending = FramesToGo // FramesPerMinute
+                            frames_to_go_time_str.set(f"{(minutes_pending // 60):02}h {(minutes_pending % 60):02}m")
+                    else:
+                        # Requested frame count reached: clear the box and, if auto-stop is
+                        # armed, stop now WITHOUT capturing an extra frame (this block used
+                        # to fall through and grab one frame beyond the requested count).
+                        ConfigData["FramesToGo"] = -1
+                        frames_to_go_str.set('')  # clear frames to go box to prevent it stops again in next scan
+                        if AutoStopEnabled and autostop_type.get() == "counter_to_zero":
+                            ScanStopRequested = True  # Stop in next capture loop
+                            win.after(5, capture_loop)
+                            return
+                CurrentFrame += 1
+                session_frames += 1
+                register_frame()
+                CurrentStill = 1
+                capture('normal')
+            # On a retry (RetryingFrame) the frame was already captured and queued for
+            # saving on the first attempt, so we do NOT capture again - that would queue a
+            # second async save of the same filename. We only re-send the advance command.
             if FrameDetectMode == 'PFD':
                 if not SimulatedRun:
-                    try:
-                        # Set NewFrameAvailable to False here, to avoid overwriting new frame from arduino
-                        NewFrameAvailable = False
-                        logging.debug("Frame %i captured.", CurrentFrame)
-                        send_arduino_command(CMD_GET_NEXT_FRAME)  # Tell Arduino to move to next frame
-                    except IOError:
-                        CurrentFrame -= 1
+                    # Set NewFrameAvailable to False here, to avoid overwriting new frame from arduino
+                    NewFrameAvailable = False
+                    logging.debug("Frame %i captured.", CurrentFrame)
+                    # send_arduino_command() swallows the I2C IOError internally and reports it
+                    # via its return value, so check that instead of relying on an exception
+                    # (which never propagates out of send_arduino_command).
+                    if send_arduino_command(CMD_GET_NEXT_FRAME):  # Tell Arduino to move to next frame
+                        RetryingFrame = False
+                    else:
+                        # The command did not reach the Arduino, so the frame has NOT advanced.
+                        # Retry the SAME frame without rolling back or re-advancing the counters,
+                        # so FramesToGo / session_frames are not double-counted on the retry.
                         NewFrameAvailable = True  # Set NewFrameAvailable to True to repeat next time
-                        # Log error to console
+                        RetryingFrame = True
                         logging.warning("Error while telling Arduino to move to next Frame.")
                         logging.warning("Frame %i capture to be tried again.", CurrentFrame)
                         win.after(5, capture_loop)
@@ -3298,6 +4101,8 @@ def onesec_periodic_checks():  # Update RPi temperature every 10 seconds
 
     temperature_check()
     preview_check()
+    if ALT_scann_init_done:
+        refresh_alignment_statistics()
 
     if not ExitingApp:
         onesec_after = win.after(1000, onesec_periodic_checks)
@@ -3398,11 +4203,12 @@ def send_arduino_command(cmd, param=0):
             i2c.write_i2c_block_data(16, cmd, [int(param % 256), int(param >> 8)])  # Send command to Arduino
         except IOError:
             logging.warning(
-                f"Error while sending command {cmd} (param {param}) to Arduino while handling frame {CurrentFrame}. "
-                f"Retrying...")
+                f"Error while sending command {cmd} (param {param}) to Arduino while handling frame {CurrentFrame}.")
             time.sleep(0.2)  # wait 100 µs, to avoid I/O errors
+            return False  # Report the failure; callers that must not miss the command can react
 
         time.sleep(0.0001)  # wait 100 µs, same
+    return True
 
 
 def arduino_listen_loop():  # Waits for Arduino communicated events and dispatches accordingly
@@ -3419,6 +4225,7 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
     global PtLevelValue, StepsPerFrame
     global scan_error_counter, scan_error_total_frames_counter, scan_error_counter_value
     global steps_completed, steps_submitted
+    global alignment_firmware_supported, alignment_move_result, recovery_firmware_supported
 
     if not SimulatedRun:
         try:
@@ -3434,7 +4241,7 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
                 logging.warning(
                     f"Non-critical IOError ({e}) while checking incoming event from Arduino. Will check again.")
 
-    if ScanOngoing and FrameDetectMode == 'PFD' and time.time() > last_frame_time:  # Do not force new event in case of VFD - Arduino only asked to move the C motor
+    if ScanOngoing and FrameDetectMode == 'PFD' and alignment_guard is None and alignment_recovery is None and not alignment_paused and time.time() > last_frame_time:  # Recovery and guarded holds must never synthesize a frame.
         # If scan is ongoing, and more than 3 seconds have passed since last command, maybe one
         # command from/to Arduino (frame received/go to next frame) has been lost.
         # In such case, we force a 'fake' new frame command to allow process to continue
@@ -3465,10 +4272,43 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
             exit_app(False) # If Arduino version not OK exit without saving
         else:
             refresh_qr_code()
+            alignment_firmware_supported = False
+            recovery_firmware_supported = False
+            if Controller_Id == 1:
+                send_arduino_command(CMD_ALIGN_FRAME, 0)
     elif ArduinoTrigger == RSP_FORCE_INIT:  # Controller reloaded, sent init sequence again
         logging.debug("Controller requested to reinit")
+        alignment_firmware_supported = False
+        recovery_firmware_supported = False
+        if ScanOngoing and alignment_recovery is not None:
+            pause_alignment_recovery('Controller restarted during recovery')
+        elif ScanOngoing and alignment_guard is not None:
+            pause_alignment_frame('Controller restarted during alignment')
         reinit_controller()
+        if Controller_Id == 1:
+            send_arduino_command(CMD_ALIGN_FRAME, 0)
     elif ArduinoTrigger == RSP_FRAME_AVAILABLE:  # New Frame available
+        if alignment_recovery is not None:
+            pause_alignment_recovery('Unexpected PT frame event during recovery')
+            ArduinoTrigger = 0
+            if not ExitingApp:
+                arduino_after = win.after(10, arduino_listen_loop)
+            return
+        settings = alignment_settings()
+        settings.update(reported_steps=ArduinoParam1, pt_raw=ArduinoParam2, pt_valid=0 <= ArduinoParam2 <= 1023)
+        alignment_statistics.frame(CurrentFrame + 1, time.monotonic(), origin='pt', settings=settings)
+        # The controller sends its actual detection-interval step count and
+        # raw PT reading. The threshold below is the latest reported value,
+        # not a simultaneous threshold sample from this event.
+        logging.info('Alignment stop frame=%i controller=%s reported_steps=%i pt_raw=%i '
+                     'pt_valid=%s last_reported_threshold=%s steps_setting=%s '
+                     'steps_auto=%s pt_auto=%s fine_tune=%s fine_auto=%s '
+                     'extra_steps=%s speed=%s settle_ms=%s guard=%s tolerance_pct=%s',
+                     CurrentFrame + 1, Controller_Id, ArduinoParam1, ArduinoParam2,
+                     0 <= ArduinoParam2 <= 1023, PtLevelValue, StepsPerFrame,
+                     AutoFrameStepsEnabled, AutoPtLevelEnabled, FrameFineTuneValue,
+                     AutoFineTuneEnabled, FrameExtraStepsValue, ScanSpeedValue,
+                     StabilizationDelayValue, AlignmentGuardMode, AlignmentGuardTolerance)
         # Delay shared with arduino, 2 seconds less to avoid conflict with end reel
         last_frame_time = time.time() + max_inactivity_delay - 2
         NewFrameAvailable = True
@@ -3485,7 +4325,8 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
             f.write(f"No Frame detected, {CurrentFrame}, {ArduinoParam1}, {ArduinoParam2}\n")
     elif ArduinoTrigger == RSP_SCAN_ENDED:  # Scan arrived at the end of the reel
         logging.warning("End of reel reached: Scan terminated")
-        ScanStopRequested = True
+        if ScanOngoing:  # Only act if a scan is actually running; otherwise a late/spurious
+            ScanStopRequested = True  # end-of-reel event would arm the flag for the next scan
     elif ArduinoTrigger == RSP_REPORT_AUTO_LEVELS:  # Get auto levels from Arduino, to be displayed in UI, if auto on
         if ExpertMode:
             if (AutoPtLevelEnabled):
@@ -3512,9 +4353,16 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
     elif ArduinoTrigger == RSP_FILM_FORWARD_ENDED:
         logging.warning("Received film forward end from Arduino")
         cmd_advance_movie(True)
+    elif ArduinoTrigger == RSP_ALIGN_FRAME:
+        receive_alignment_response(ArduinoParam1, ArduinoParam2)
     elif ArduinoTrigger == RSP_ADVANCE_FRAME_FRACTION:  
-        logging.debug(f"Received confirmation of {ArduinoParam1} steps done from Arduino")
-        steps_completed = True
+        if alignment_recovery is not None:
+            receive_recovery_response(ArduinoParam1, ArduinoParam2)
+        elif FrameDetectMode == 'VFD':
+            logging.debug(f"Received confirmation of {ArduinoParam1} steps done from Arduino")
+            steps_completed = True
+        else:
+            logging.warning('Ignoring stale movement acknowledgement %i', ArduinoParam1)
     else:
         logging.warning("Unrecognized incoming event (%i) from Arduino.", ArduinoTrigger)
 
@@ -3755,6 +4603,7 @@ def validate_config_folders():
 
 
 def load_config_data_pre_init():
+    global AlignmentGuardMode, AlignmentGuardTolerance
     global ExpertMode, ExperimentalMode, PlotterEnabled, SimplifiedMode, UIScrollbars, DetectMisalignedFrames, MisalignedFrameTolerance, FontSize, DisableToolTips, BaseFolder
     global WidgetsEnabledWhileScanning, LogLevel, LoggingMode, ColorCodedButtons, TempInFahrenheit, LogLevel
     global UserConsent, AnonymousUuid, LastConsentDate
@@ -3780,6 +4629,10 @@ def load_config_data_pre_init():
                 PlotterEnabled = ConfigData["PlotterMode"]
         if 'UIScrollbars' in ConfigData:
             UIScrollbars = ConfigData["UIScrollbars"]
+        AlignmentGuardMode = ConfigData.get('AlignmentGuardMode', 'Correct')
+        if AlignmentGuardMode not in ('Off', 'Pause', 'Correct'):
+            AlignmentGuardMode = 'Correct'
+        AlignmentGuardTolerance = max(0.5, min(10.0, float(ConfigData.get('AlignmentGuardTolerance', 3))))
         if 'DetectMisalignedFrames' in ConfigData:
             DetectMisalignedFrames = ConfigData["DetectMisalignedFrames"]
         if 'MisalignedFrameTolerance' in ConfigData:
@@ -4087,12 +4940,12 @@ def load_session_data_post_init():
                 if 'MinFrameStepsR8' in ConfigData:
                     MinFrameStepsR8 = ConfigData["MinFrameStepsR8"]
                 if 'FrameFineTune' in ConfigData:
-                    FrameFineTuneValue = ConfigData["FrameFineTune"]
+                    FrameFineTuneValue = max(5, min(95, ConfigData["FrameFineTune"]))
                     frame_fine_tune_value.set(FrameFineTuneValue)
                     send_arduino_command(CMD_SET_FRAME_FINE_TUNE, FrameFineTuneValue)
                 if 'FrameExtraSteps' in ConfigData:
                     FrameExtraStepsValue = ConfigData["FrameExtraSteps"]
-                    FrameExtraStepsValue = min(FrameExtraStepsValue, 20)
+                    FrameExtraStepsValue = max(-30, min(FrameExtraStepsValue, 150))
                     frame_extra_steps_value.set(FrameExtraStepsValue)
                     send_arduino_command(CMD_SET_EXTRA_STEPS, FrameExtraStepsValue)
                 if 'PTLevelAuto' in ConfigData:     # Delete legacy name, replace with new
@@ -4195,7 +5048,7 @@ def load_session_data_post_init():
         widget_list_enable([id_ManualScanEnabled, id_AutoStopEnabled, id_ExposureWbAdaptPause, 
                             id_HdrCaptureActive, id_HdrBracketAuto])
         if not SimplifiedMode:
-            scan_error_counter_value_label.config(state=NORMAL if DetectMisalignedFrames else DISABLED)
+            if ExpertMode: scan_error_counter_value_label.config(state=NORMAL if DetectMisalignedFrames else DISABLED)
 
         # Display current capture settings as loaded from file
         capture_info_str.set(f"{FileType} - {CaptureResolution}")
@@ -4239,23 +5092,42 @@ def PiCam2_change_resolution():
     capture_config["main"]["size"] = camera_resolutions.get_image_resolution()
     # capture_config["main"]["format"] = camera_resolutions.get_format()
     capture_config["raw"]["size"] = camera_resolutions.get_sensor_resolution()
-    capture_config["raw"]["format"] = camera_resolutions.get_format()
+    capture_config["raw"]["format"] = camera_resolutions.get_unpacked_format()
     camera.stop()
     camera.configure(capture_config)
     camera.start()
 
+    raw_format = camera.camera_configuration()["raw"]["format"]
+    logging.info(f"Raw stream format granted by camera pipeline: {raw_format}")
+    if "COMP" in raw_format:
+        logging.warning(f"Raw format {raw_format} is lossy-compressed, DNG captures will not be lossless")
     logging.debug(f"Camera resolution set at: {CaptureResolution}")
 
+
+
+def camera_metadata_callback(request):
+    # Runs in the camera event loop for every completed request
+    global LastCameraMetadata
+    LastCameraMetadata = request.get_metadata()
 
 
 def PiCam2_configure():
     global capture_config, preview_config, vfd_config
 
     camera.stop()
+    # buffer_count > 1 keeps the camera pipeline streaming between captures
+    # (a single buffer forces a full pipeline round trip per request), and
+    # queue=False makes each capture wait for a frame exposed after the request
+    # was made - so a capture right after film transport cannot return a frame
+    # exposed while the film was still moving.
     capture_config = camera.create_still_configuration(main={"size": camera_resolutions.get_sensor_resolution()},
+                                                       # Request the unpacked raw format: the packed (_CSI2P) request is
+                                                       # not supported by the Pi 5 pipeline, which silently substitutes
+                                                       # the lossy-compressed PISP_COMP1 format, degrading DNG output.
                                                        raw={"size": camera_resolutions.get_sensor_resolution(),
-                                                            "format": camera_resolutions.get_format()},
-                                                       transform=Transform(hflip=True))
+                                                            "format": camera_resolutions.get_unpacked_format()},
+                                                       transform=Transform(hflip=True),
+                                                       buffer_count=3, queue=False)
 
     preview_config = camera.create_preview_configuration({"size": (2028, 1520)}, transform=Transform(hflip=True))
     # 2028x1520 selects the full-FOV binned sensor mode; a 1332x990 request can
@@ -4323,19 +5195,20 @@ def on_configure_scrolled_canvas(event):
 
 # Initialize widgets with multiple dependencies
 def init_multidependent_widgets():
-    if HdrCaptureActive == HdrBracketAuto and HdrBracketAuto:
+    if ExperimentalMode and HdrCaptureActive == HdrBracketAuto and HdrBracketAuto:
         hdr_min_exp_label.disabled_counter = 1
         hdr_max_exp_label.disabled_counter = 1
         hdr_min_exp_spinbox.disabled_counter = 1
         hdr_max_exp_spinbox.disabled_counter = 1
 
-    frame_fine_tune_spinbox.disabled_counter = 0
-    if not AutoPtLevelEnabled:
-        frame_fine_tune_spinbox.disabled_counter += 1
-    if  AutoFineTuneEnabled:
-        frame_fine_tune_spinbox.disabled_counter += 1
-    frame_vcenter_spinbox.disabled_counter = 1
-    
+    if ExpertMode:
+        frame_fine_tune_spinbox.disabled_counter = 0
+        if not AutoPtLevelEnabled:
+            frame_fine_tune_spinbox.disabled_counter += 1
+        if  AutoFineTuneEnabled:
+            frame_fine_tune_spinbox.disabled_counter += 1
+        frame_vcenter_spinbox.disabled_counter = 1
+
     widget_list_refresh([id_HdrBracketAuto, id_AutoPtLevelEnabled, id_AutoFineTuneEnabled, id_FrameVCenterEnabled])
 
 def display_splash():
@@ -4494,16 +5367,13 @@ def tscann8_init():
     global capture_save_queue, capture_save_event
     global MergeMertens, camera_resolutions
     global active_threads
-    global time_save_image, time_preview_display, time_awb, time_autoexp, offset_image
+    global time_save_image, time_preview_display, time_awb, time_autoexp
     global hw_panel, hw_panel_installed
 
     if SimulatedRun:
         logging.info("Not running on Raspberry Pi, simulated run for UI debugging purposes only")
     else:
         logging.info("Running on Raspberry Pi")
-
-    if not can_check_dng_frames_for_misalignment:
-        logging.warning("Frame alignment for DNG files is disabled. To enable it please install rawpy library")
 
     logging.debug("BaseFolder=%s", BaseFolder)
 
@@ -4518,6 +5388,7 @@ def tscann8_init():
         camera_resolutions = CameraResolutions(camera.sensor_modes)
         logging.info(f"Camera Sensor modes: {camera.sensor_modes}")
         PiCam2_configure()
+        camera.post_callback = camera_metadata_callback
         ZoomSize = camera.capture_metadata()['ScalerCrop']
         logging.debug(f"ScalerCrop: {ZoomSize}")
     if SimulatedRun:
@@ -4529,7 +5400,6 @@ def tscann8_init():
     time_preview_display = RollingAverage(50)
     time_awb = RollingAverage(50)
     time_autoexp = RollingAverage(50)
-    offset_image = RollingAverage(5)
 
     create_main_window()
 
@@ -4781,6 +5651,7 @@ def cmd_set_auto_fine_tune():
     widget_list_enable([id_AutoFineTuneEnabled])
     fine_tune_btn.config(text="Fine Tune AUTO:" if AutoFineTuneEnabled else "Fine Tune:")
     ConfigData["AutoFineTuneEnabled"] = AutoFineTuneEnabled
+    fine_tuner.reset()
 
 
 def cmd_pt_level_selection():
@@ -4846,6 +5717,7 @@ def draw_static_arrows(canvas, width, height):
 def cmd_set_frame_vcenter():
     global FrameVCenterEnabled, FrameVCenterImage, save_canvas_image
     global FrameVCenterHoleShift, FrameVCenterImageShift
+    global FrameVCenterImageShiftS8, FrameVCenterImageShiftR8
 
     if IsSplashDisplayed:
         tk.messagebox.showinfo(
@@ -4873,6 +5745,17 @@ def cmd_set_frame_vcenter():
         # Convert RGB to BGR
         bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
         _, FrameVCenterHoleShift = is_frame_centered(bgr_image, FilmType, compensate=False)
+        if FrameVCenterHoleShift is None:
+            FrameVCenterEnabled = False
+            frame_vcenter_enabled.set(False)
+            except_widget_global_enable([frame_vcenter_btn, frame_vcenter_spinbox], True)
+            widget_list_enable([id_FrameVCenterEnabled])
+            tk.messagebox.showwarning("Sprocket not found", "Cannot calibrate vertical centering without a visible sprocket hole.")
+            return
+        # Temporary diagnostics: dump the exact analyzed image and result for column_probe.py
+        cv2.imwrite('/tmp/vcenter_input.png', bgr_image)
+        logging.warning(f"VCenter probe: analyzed image {bgr_image.shape[1]}x{bgr_image.shape[0]}, "
+                        f"detected hole shift {FrameVCenterHoleShift}")
         width, height = FrameVCenterImage.size
         # Draw a line in the middle of the hole(s)
         draw = ImageDraw.Draw(FrameVCenterImage)
@@ -4894,6 +5777,7 @@ def cmd_set_frame_vcenter():
         draw_outlined_text(draw, text_position, text_content, fill=text_color, outline_color="black", font=font)
         # Finally, add the line and text to the image
         new_image = Image.new("RGB", (width, height), (0, 0, 0, 0))  # Create new image.
+        # Shift image by -FrameVCenterHoleShift so hole center starts aligned with the reference line
         new_image.paste(FrameVCenterImage, (0, FrameVCenterImageShift-FrameVCenterHoleShift))
         photo_image = ImageTk.PhotoImage(new_image)
         draw_capture_canvas.itemconfig(draw_capture_canvas_image_id, image=photo_image)
@@ -4907,6 +5791,11 @@ def cmd_set_frame_vcenter():
         # First, draw back S8/R8 markers
         display_left_markers()
         ConfigData["FrameVCenterImageShift" + ConfigData["FilmType"]] = FrameVCenterImageShift
+        # Keep the per-film-type value in sync, otherwise switching film type restores the stale startup value
+        if ConfigData["FilmType"] == "S8":
+            FrameVCenterImageShiftS8 = FrameVCenterImageShift
+        else:
+            FrameVCenterImageShiftR8 = FrameVCenterImageShift
         # Save image to restore it when done
         draw_capture_canvas.itemconfig(draw_capture_canvas_image_id, image=save_canvas_image)
         draw_capture_canvas.image = save_canvas_image
@@ -4942,7 +5831,7 @@ def vcenter_validation(new_value):
 
 
 def extra_steps_validation(new_value):
-    return value_validation(new_value, frame_extra_steps_spinbox, -30, 30, 0)
+    return value_validation(new_value, frame_extra_steps_spinbox, -30, 150, 0)
 
 
 def cmd_scan_speed_selection():
@@ -5209,6 +6098,8 @@ def destroy_widgets(container, delete_top = False):
 
 
 def create_widgets():
+    global alignment_guard_mode_var, alignment_guard_tolerance_var, alignment_status_var
+    global alignment_stats_button_var
     global win
     global AdvanceMovie_btn
     global negative_image_checkbox, negative_image
@@ -5400,16 +6291,21 @@ def create_widgets():
 
     # Frame for single step/snapshot
     sstep_area_frame = Frame(top_left_area_frame, name='sstep_area_frame')
-    sstep_area_frame.grid_forget()
+    sstep_area_frame.grid(row=bottom_area_row, column=bottom_area_column, columnspan=2, sticky='NSEW')
+    sstep_area_frame.columnconfigure(0, weight=1)
+    sstep_area_frame.columnconfigure(1, weight=1)
+    bottom_area_row += 1
     # Advance one single frame
     singleStep_btn = Button(sstep_area_frame, text="Single Step", command=cmd_single_step_movie,
                             activebackground='#f0f0f0', font=("Arial", FontSize), name='singleStep_btn')
     singleStep_btn.widget_type = "general"
-    singleStep_btn.grid_forget()
+    singleStep_btn.grid(row=0, column=0, padx=x_pad, pady=y_pad, sticky='NSEW')
+    as_tooltips.add(singleStep_btn, "Advance the film by one single frame.")
     snapshot_btn = Button(sstep_area_frame, text="Snapshot", command=cmd_capture_single_step,
                           activebackground='#f0f0f0', font=("Arial", FontSize), name='snapshot_btn')
     snapshot_btn.widget_type = "general"
-    snapshot_btn.grid_forget()
+    snapshot_btn.grid(row=0, column=1, padx=x_pad, pady=y_pad, sticky='NSEW')
+    as_tooltips.add(snapshot_btn, "Capture the current frame as a still picture, without advancing the film.")
 
     # Rewind movie (via upper path, outside of film gate)
     rewind_btn = Button(top_left_area_frame, text="◀◀", font=("Arial", FontSize + 3), height=2, command=cmd_rewind_movie,
@@ -6234,7 +7130,7 @@ def create_widgets():
         if ColorCodedButtons:
             fine_tune_btn.config(selectcolor="pale green")
         fine_tune_btn.grid(row=frame_align_row, column=0, columnspan=2, sticky="EW")
-        as_tooltips.add(fine_tune_btn, "Toggle automatic fine-tune frame position calculation.")
+        as_tooltips.add(fine_tune_btn, "Use confirmed camera samples to adjust Fine Tune slowly. Requires PT Level Auto. Works with the alignment guard Off, Pause or Correct; inactive in Visual Detection.")
 
         frame_fine_tune_value = tk.IntVar(value=FrameFineTuneValue)  # To be overridden by config
         frame_fine_tune_spinbox = DynamicSpinbox(frame_alignment_frame, command=cmd_frame_fine_tune_selection, width=4,
@@ -6282,18 +7178,41 @@ def create_widgets():
         frame_extra_steps_label.grid(row=frame_align_row, column=0, padx=x_pad, pady=y_pad, sticky="W")
 
         frame_extra_steps_value = tk.IntVar(value=FrameExtraStepsValue)  # To be overridden by config
-        frame_extra_steps_spinbox = DynamicSpinbox(frame_alignment_frame, command=cmd_frame_extra_steps_selection, width=4,
-                                                   readonlybackground='pale green', from_=0, to=30,
+        frame_extra_steps_spinbox = DynamicSpinbox(frame_alignment_frame, command=cmd_frame_extra_steps_selection, width=5,
+                                                   readonlybackground='pale green', from_=-30, to=150,
                                                    textvariable=frame_extra_steps_value, font=("Arial", FontSize - 1),
                                                    name='frame_extra_steps_spinbox')
         frame_extra_steps_spinbox.widget_type = "control"
         frame_extra_steps_spinbox.grid(row=frame_align_row, column=1, columnspan=2, padx=x_pad, pady=y_pad, sticky=E)
         cmd_extra_steps_validation_cmd = frame_extra_steps_spinbox.register(extra_steps_validation)
         frame_extra_steps_spinbox.configure(validate="key", validatecommand=(cmd_extra_steps_validation_cmd, '%P'))
-        as_tooltips.add(frame_extra_steps_spinbox, "Unconditionally advances/detects the frame n steps after/before "
-                                                   "detection (n between 0 and 30). Negative values can help if "
-                                                   "film gate is not correctly positioned.")
+        as_tooltips.add(frame_extra_steps_spinbox, "Unconditionally advances the frame n steps after detection "
+                                                   "(1 to 30). Negative values (-30 to -1) reduce the minimum steps "
+                                                   "per frame instead, can help if film gate is not correctly positioned.")
         frame_extra_steps_spinbox.bind("<FocusOut>", lambda event: cmd_frame_extra_steps_selection())
+        frame_align_row += 1
+
+        tk.Label(frame_alignment_frame, text="Alignment guard:", font=("Arial", FontSize - 1)).grid(
+            row=frame_align_row, column=0, sticky=W)
+        alignment_guard_mode_var = tk.StringVar(value=AlignmentGuardMode)
+        guard_menu = tk.OptionMenu(frame_alignment_frame, alignment_guard_mode_var, 'Off', 'Pause', 'Correct', command=cmd_alignment_guard)
+        guard_menu.configure(font=("Arial", FontSize - 2), padx=3, pady=0, borderwidth=1)
+        guard_menu.widget_type = 'control'
+        guard_menu.grid(row=frame_align_row, column=1, columnspan=2, sticky=E)
+        as_tooltips.add(guard_menu, "Check framing before saving or advancing. Correct uses bounded forward nudges on supported Nano firmware (S8); otherwise it pauses. Off disables protection.")
+        frame_align_row += 1
+        tk.Label(frame_alignment_frame, text="Guard tolerance (%):", font=("Arial", FontSize - 1)).grid(
+            row=frame_align_row, column=0, sticky=W)
+        alignment_guard_tolerance_var = tk.StringVar(value=str(AlignmentGuardTolerance))
+        guard_tolerance = tk.Spinbox(frame_alignment_frame, from_=0.5, to=10, increment=0.5, width=4,
+            textvariable=alignment_guard_tolerance_var, command=cmd_alignment_guard)
+        guard_tolerance.widget_type = 'control'
+        guard_tolerance.bind('<FocusOut>', cmd_alignment_guard)
+        guard_tolerance.grid(row=frame_align_row, column=1, columnspan=2, sticky=E)
+        frame_align_row += 1
+        alignment_status_var = tk.StringVar(value='Ready' if alignment_firmware_supported else 'Pause only; Nano update needed')
+        tk.Label(frame_alignment_frame, textvariable=alignment_status_var, font=("Arial", FontSize - 3),
+            width=30, height=1, anchor=W).grid(row=frame_align_row, column=0, columnspan=3, sticky=W)
         frame_align_row += 1
 
         # Scan error counter
@@ -6307,6 +7226,11 @@ def create_widgets():
                                   font=("Arial", FontSize-1), justify="right", name='scan_error_counter_value_label')
         scan_error_counter_value_label.grid(row=frame_align_row, column=1, columnspan=2, padx=x_pad, pady=y_pad, sticky=E)
         as_tooltips.add(scan_error_counter_value_label, "Number of frames missed or misaligned during scanning.")
+        frame_align_row += 1
+        alignment_stats_button_var = tk.StringVar(value='Alignment statistics…')
+        tk.Button(frame_alignment_frame, textvariable=alignment_stats_button_var,
+                  command=show_alignment_statistics, font=('Arial', FontSize - 3),
+                  padx=2, pady=1).grid(row=frame_align_row, column=0, columnspan=3, sticky='EW')
         frame_align_row += 1
 
         # ***************************************************
@@ -6624,6 +7548,11 @@ def create_widgets():
     win.update()
     app_width = min(main_container.winfo_reqwidth(), screen_width - 150)
     app_height = min(main_container.winfo_reqheight(), screen_height - 150) + menu_bar.winfo_reqheight()
+    if not ExpertMode:
+        # Expert-area widgets are not created, but their tk variables are used elsewhere
+        scan_error_counter_value = tk.StringVar(value="0 (0%)")
+        frame_vcenter_value = tk.IntVar(value=FrameVCenterImageShift)
+
     if ExpertMode and extended_frame.winfo_reqwidth() > top_area_frame.winfo_reqwidth():
         x = int((extended_frame.winfo_reqwidth() - top_area_frame.winfo_reqwidth()) / 2)
         top_area_frame.config(padx=x-1)

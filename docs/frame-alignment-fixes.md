@@ -1,0 +1,335 @@
+# Frame alignment fixes
+
+Branch: `frame-alignment-fixes`, based on the Pi's deployed `651f5d8`.
+
+## Behavior
+
+### Verified Auto Fine Tune
+
+There is one Auto Fine Tune algorithm. It now uses confirmed camera feedback
+instead of the old five-sample average and up-to-ten-point jumps. The controls
+are independent: with **PT Level Auto** on and **Visual Detection** off, Auto Fine
+Tune can operate with the guard **Off**, **Pause** or **Correct**. Guard Off still
+means no framing pauses or corrective nudges; uncertain tuning samples are ignored.
+Manual PT and Visual Detection make the tuner inactive, with the reason displayed
+in Alignment statistics. The manual Fine Tune value remains available as before.
+
+Every fifth clean frame is sampled with two fresh, settled exposures. Suspect
+frames reuse the guard's existing confirmation. Pairs must agree within 1.5% of
+image height, and feedback is recorded once from the original stop, before any
+nudge. Single-exposure checks, YOLO results, uncertain/extreme offsets (over 25%),
+invalid PT readings, missing stop telemetry, and stops within two steps of the
+minimum detection gate do not adjust the tuner. Recovery does not feed it.
+
+After five frames of settings warmup, at least eight verified samples and a
+75% majority outside a 1% deadband are required. A change is exactly one Fine Tune
+point, bounded to 5–95. It then waits 20 frames and collects fresh evidence.
+Reversing direction needs 16 samples and a 1.5% deadband. Configuration changes,
+recovery, long sampling gaps and pauses over 60 seconds discard stale evidence.
+Failed sends retain the displayed/saved value and wait before collecting more
+evidence; successful I2C writes update both live and saved trim values. The existing
+threshold-setting command has no controller acknowledgement, so logs say `sent`,
+not hardware-readback-verified. Each proposed change logs its evidence, settings,
+frame and statistics run ID as `Alignment tuning` JSON.
+
+### Alignment statistics
+
+The expert Frame align panel shows a compact summary and an **Alignment statistics**
+button. Its detail window compares the last 100 frame positions with the current
+scan session: aligned-on-arrival percentage, undershoots, overshoots, unknown and
+unmeasured arrivals, median signed offset, 95th-percentile absolute error,
+correction frames/nudges/acknowledged steps, pauses, recovery attempts/results/steps,
+saved-as-is overrides, captures and effective frames/sec. It also shows tuner status
+and the current guard tolerance, PT, Fine Tune and step settings.
+The table groups alignment, corrections/recovery, and throughput, with fixed
+numeric columns and the position count for each scope. The header shows scan state,
+frame range and elapsed time; Auto Fine Tune status appears in its own panel.
+
+Statistics use original PT-stop positions. Clean guard checks use the usual
+multi-strip evidence; suspect positions and sampled tuning positions require two
+exposures. The separate confirmation count identifies those pairs. Disagreeing
+pairs are unknown, rather than silently replaced by a later corrected position.
+Unknown and unmeasured arrivals remain in the PT-arrival denominator. If nothing
+has been measured, the aligned percentage is unavailable. With guard Off and
+Auto Fine Tune inactive, no extra camera checks run and arrivals remain unmeasured.
+Camera-recovered positions are excluded from PT-arrival quality statistics.
+
+Counts are per frame, so Retry does not rewrite the arrival or double-count
+captures/pauses. Ordinary nudge steps count only after matching acknowledgements.
+“Saved as-is” means explicit acceptance; it does not prove picture area was lost.
+“Captured” means the exposure set was captured/queued; file saving can finish later.
+Effective speed includes transport, verification, pauses and recovery. Stop freezes
+the elapsed time; starting another scan resets the panel and gives it a new run ID.
+
+The same snapshot shown in the window is logged as `Alignment statistics` JSON
+at start, every 30 seconds, after 100 additional captures, and at stop/exit. Logs
+include frame bounds, measurement coverage, tolerances, observed Fine Tune/step
+values, current settings and tuner status so changed tolerances or settings do
+not silently masquerade as improved transport accuracy. Historical runs remain
+in the application log. No firmware update is needed for tuning or statistics.
+
+Fine Tune uses camera RGB measurements regardless of DNG output, `rawpy`, or
+“Bad frames”. Feedback runs in capture order before the next transport command;
+background saving only reports errors. Failed hole detection contributes no
+numeric offset. Fine Tune stays in the Nano's supported 5–95 range, and DNG error
+logs name the frame that was actually saved.
+
+The expert controls add **Alignment guard**:
+
+- **Off**: normal scanning and Fine Tune, without the pre-save protection.
+- **Pause**: confirm a suspect position with another exposure of the stationary
+  frame, then hold it without saving or advancing.
+- **Correct** (default): on S8 with supporting Nano firmware, try bounded forward
+  nudges and recheck before saving. Without firmware support, use Pause behavior.
+  R8 also uses Pause behavior; automatic reversal is never attempted.
+
+Guard tolerance defaults to **3% of image height**, independently of the existing
+8% bad-frame reporting tolerance. Set Frame VCenter for the film before scanning.
+This verifies sprocket position relative to that calibrated target, not the actual
+picture borders: stock with a different picture-to-hole relationship can require
+recalibration. At least two of three detection strips must agree on a complete
+hole (S8) or gap (R8). One outlying strip is ignored only when the agreeing pair
+is unique. Clipped or ambiguous detections pause instead of driving the motor.
+
+A pause dialog offers **Retry this frame**, **Save and continue**, **Save this frame and stop**, and
+**Stop without saving**. Retry rechecks the held physical frame without incrementing
+counters. Save explicitly accepts its position, uses the normal scan format and
+next frame number (including HDR when enabled), and updates counters once.
+Save and continue advances after capture; an I2C send failure retries only the
+advance, without saving or counting again. An armed frame-count stop still stops
+after the last requested frame. Save this frame and stop keeps the film held.
+Continuing also resets the controller watchdog interval, so time spent paused
+cannot immediately trigger a synthetic frame event after the next advance.
+Normal save workers finish writing queued exposures after stopping.
+Stop without saving leaves this frame unsaved; a normal scan start requests a new
+film frame. Guard events include its intended filename in the scan error log.
+
+### Forward recovery after an overshoot
+
+On Super 8 in PT detection mode, a confirmed overshoot also offers
+**Save and find next frame** when Nano 1.1.13 recovery support is detected.
+This explicitly saves the partial current frame with its regular number, then
+seeks the **next** physical frame. Forward movement cannot restore the cropped
+area of the frame that has already passed the target. Ordinary **Save and
+continue** retains its existing behavior.
+
+Recovery uses command 42 (the existing manual/visual movement command), with
+acknowledged moves of at most eight steps. Collection stays suspended throughout
+movement, camera checks and capture. Each checked position needs two fresh,
+settled exposures. Recovery refreshes the preview from those same exposures,
+regardless of the normal preview interval, and displays travel and current offset.
+The detector must follow the old complete sprocket towards
+the top edge and observe the next complete sprocket entering from the bottom
+before accepting it near the center. It uses the strip/adaptive detector; YOLO
+does not authorize recovery travel.
+
+Unknown detections only permit a bounded crossing after the old sprocket has
+reached the top-edge region. A missing next hole, unexpected movement, stationary
+disagreement, or a second overshoot stops recovery. The Python limits are 1.1
+nominal frame pitches, 80 moves and 90 seconds. Centering uses the configured
+guard tolerance capped at 3%. The nominal pitch comes from the capstan geometry,
+not the minimum PT detection gate. These conservative limits can reject damaged
+film; this mode is not an unrestricted search for any later good frame.
+
+Entry, movement and exit each require matching command-42 acknowledgements.
+A refused command, uncertain send or three-second acknowledgement timeout stops
+without repeating a potentially completed move. Command 42 has no sequence token;
+only one command is outstanding, and an interrupted seek cannot be resumed by
+Retry or Save. The failure dialog offers Stop and identifies the last saved frame;
+inspect the film position before restarting. Stop remains available during recovery.
+
+After the next frame is verified, the controller rebases its PT step counter
+while retaining the stationary hold. The verified camera request is reused for
+normal capture, the next filename/counters advance once, and normal PT scanning
+resumes. Recovery measurements do not feed automatic Fine Tune. An armed frame
+count stop can finish after saving the partial frame without starting recovery.
+All recovery commands, measurements, travel totals and failures appear in the log.
+
+Normal DNG/PNG captures reuse the checked camera request. JPEG uses its RGB image.
+HDR and captures requesting exposure adaptation verify position first, then take
+their required exposures while the film stays stationary.
+During ordinary guard corrections, the preview also displays the checked position
+before movement and after every nudge, including the final accepted position.
+These updates use existing exposures and bypass the normal preview interval.
+
+### Damaged sprocket fallback
+
+If the usual three strips cannot agree, the detector searches 0.5–6% of the
+image width for a clean interior band. Three adjacent, non-overlapping strips
+must agree on both edges, within 1.5% of image height. Multiple supported bands
+with different edges remain unknown. The damaged sprocket in saved frame 1996
+is recovered this way: -36 pixels on a 1520-pixel-high DNG render (-2.37%).
+
+With the guard enabled, an unknown classical result invokes the optional
+NCNN YOLO11n fallback. It requires one complete corner pair, confidence at least
+0.65 for each corner, plausible geometry, and agreement across two stationary
+exposures. Neural measurements do not feed the automatic Fine Tune loop.
+One corner, a frame seam, missing runtime/model, an inference error, or a ten-second
+timeout cannot authorize movement or saving. Tk stays responsive during inference;
+stop/retry discards the result and releases the held camera request.
+
+The exported model and installation instructions are in
+[`models/sprocket-ncnn`](../models/sprocket-ncnn/README.md). No accelerator is required.
+On this 4 GB Pi 5 while scanning, eight saved-frame previews took 448 ms for the
+first inference, then 102–298 ms (median 118 ms) at 640×640 with two CPU threads.
+The strip detector took around 1 ms; the adaptive search on frame 1996 took 4.3 ms.
+These exclude decoding and camera acquisition. Full live camera buffers cost
+additional conversion/copy time, and a YOLO decision needs two exposures.
+
+The model accepted a complete pair on frame 146, agreeing with the classical
+center within one pixel. It declined the other seven sample frames, including
+1996 where only the top corner was confidently detected. This is a conservative
+fallback, not a guarantee that every damaged hole will be detected.
+
+Reproduce offline measurements without opening the camera or moving film:
+
+```sh
+.venv/bin/python tools/sprocket_bench.py /path/to/saved/frames/*.png
+```
+
+### Live scan observations, 2026-09-05
+
+On `ven-1f3`, frame 146 was rejected twice despite a nearly centered sprocket.
+Reprocessing its saved DNG at full resolution reproduced the rejection: strip
+centers were 1486.0, 1485.5 and 1378.5 pixels. A dark mark interrupted the third
+strip. The unique agreeing-pair fix returns -34.25 pixels (-1.13%) instead of
+unknown. These are measurements of the saved DNG render, not the discarded
+preflight exposures.
+
+The live log confirms forward corrections on frames 456, 457 and 460: 19, 21 and
+18 steps respectively, with residuals 81.5, 95.0 and 64.0 pixels. Fine Tune then
+reported its upper limit of 95 with an average offset of 81 pixels. Overshoot
+pauses occurred at frame 63 (-6.2%), 389 (-7.5%) and 531 (-8.0%). Increasing guard
+tolerance admits these offsets; it does not stabilize the transport.
+
+The cause of that remaining position variation is not established. Candidate
+contributors include the interaction of the dynamic PT threshold, learned
+minimum-step gate, and delayed camera Fine Tune feedback (five-frame average,
+up to ten ratio points per adjustment, two measured frames between adjustments),
+along with transport tension/slip. A controlled comparison with fixed Fine Tune
+and per-frame offset/threshold/step telemetry is needed to distinguish them.
+
+After restarting at frame 3700 on September 6, 49 of frames 3701–3795 required
+forward correction. Frame 3795 needed 28 steps and finished at -3 pixels;
+3796 onward initially needed no correction. Fine Tune reached 95 with an average
+offset of +402 pixels during the run. Settings were manual minimum 250 steps,
+automatic PT level, automatic Fine Tune, and 8% guard tolerance. No YOLO calls
+were logged during this run. A separate disagreement pause occurred at frame 3829.
+
+The restart loaded Fine Tune 25 from the session file: automatic changes had
+updated the live value but not the configuration. Successful automatic updates
+now also update the global and film-specific saved trim values, which are written
+by normal session saving. Failed I2C writes leave those values untouched. Trim
+changes are logged at INFO to make later oscillations traceable. This fixes stale
+trim restoration; it does not establish the cause of every undershoot episode.
+
+## Nano firmware
+
+`ALT-Scann8-Controller.ino` is now version **1.1.13**. The Pico variants are not
+changed. The app probes support rather than relying on a version string.
+
+Command 44 with parameter zero queries alignment support. For movement, the high
+byte is a token (1–127), and the low byte is forward steps (1–40). Response 91
+echoes the packed parameter and actual moved steps; zero moved steps means refusal.
+Only a matching acknowledgement completes a pending move. A three-second timeout
+pauses without resending an uncertain movement command.
+
+Command 44 parameter 32767 separately probes forward recovery: response 91 echoes
+32767 with value 2. Older alignment firmware returns zero, leaving recovery
+unavailable while preserving normal corrections. Command 42 parameter 401 enters
+recovery only on a held S8 PT frame; parameter 402 leaves it without advancing.
+Response 90 echoes each parameter with status 1 for success or 0 for refusal.
+During recovery, command 42 allows 1–8 steps per move, up to 1.25 nominal pitches
+in the controller. The normal 1–400-step manual/VFD behavior remains unchanged
+outside recovery. Enter/exit reset the PT interval counter; normal scan/next-frame
+commands are blocked until recovery exits. Stop cancels recovery.
+
+The controller permits nudges only while holding a PT-detected frame, suspends
+collection during that hold, and includes corrective travel in the next frame's
+minimum-step calculation. Each frame is limited to one third of the minimum
+frame travel. Python additionally limits correction to four attempts, confirms
+improvement after each nudge, and waits for a fresh settled exposure. The configured
+guard tolerance applies both before and after correction; a nudge does not tighten
+the acceptance limit.
+
+Build for this scanner's Nano old bootloader:
+
+```sh
+mkdir -p /tmp/alignment-nano/ALT-Scann8-Controller
+cp ALT-Scann8-Controller.ino /tmp/alignment-nano/ALT-Scann8-Controller/
+arduino-cli compile --fqbn arduino:avr:nano:cpu=atmega328old \
+  --build-path /tmp/alignment-nano/build \
+  --output-dir /tmp/alignment-nano/output \
+  /tmp/alignment-nano/ALT-Scann8-Controller
+```
+
+This scanner's PCB cannot safely have the external PSU and Nano USB power connected
+at the same time. For every Nano firmware update:
+
+1. Stop scanning and disconnect the external PSU.
+2. Connect the Nano by USB, then flash and verify the firmware.
+3. Disconnect USB before restoring external PSU power.
+4. Once the Pi is back online, restart the app and verify controller recognition.
+
+The Pi being unreachable during this procedure is expected; do not require it to
+be online for the USB flashing step.
+
+Deploying Python alone enables the fixes and pause protection; automatic nudging
+remains unavailable until the Nano update is installed. After restarting the app,
+check that the status says automatic correction is available.
+
+## Validation
+
+### Alignment diagnostics
+
+The normal application log records these events at INFO, all using the intended
+next frame number (before it is saved):
+
+- `Alignment stop`: Nano-reported detection-interval steps, raw PT reading and
+  validity, latest reported PT threshold, step/Fine Tune settings and Auto flags,
+  Extra Steps, scan speed, settling delay, guard mode and tolerance.
+- `Alignment measurement`: initial, confirmation, or after-nudge exposure;
+  offset in pixels and percent, image height, detector source, sensor timestamp,
+  exposure duration, and any unknown-detection reason.
+- `Alignment fallback`: the classical detector failed and YOLO is being tried.
+- `Alignment nudge planned` / `send` / `ack`: starting offset, nudge number,
+  requested steps, command token, and controller-reported steps. Failed sends
+  and acknowledgement timeouts are also logged.
+- `Alignment nudge result`: offsets before and after each move and their signed
+  difference. Positive improvement means movement in the expected direction;
+  inspect the final offset too, because a move can cross past the target.
+
+The reported step count includes corrections after the previous PT detection;
+it counts commanded transport steps, not independently measured film travel.
+Positive Extra Steps are not included in that firmware counter. The threshold
+is labelled `last_reported_threshold` because the existing stop message includes
+only steps and PT, not its simultaneous threshold. A PT value outside 0–1023 is
+retained as raw diagnostic data with `pt_valid=False`.
+
+Logging uses existing messages and request metadata. It adds no exposures or
+controller polling. The Pi log timestamp marks receipt/processing; the camera
+sensor timestamp uses its boot-time clock. These records help locate the error
+in the sequence, but do not by themselves prove physical slip versus a changing
+image measurement.
+
+Run `python -m unittest discover -s tests -v`. Tests cover unknown detections,
+DNG reporting, ordered feedback, request ownership, stale exposures, unchanged
+counters on rejection, correction bounds, overshoot, missing/stale acknowledgements,
+and I2C failures. A C++ harness runs the actual firmware command handler against a
+fake transport; the complete sketch is also compiled for the Nano.
+
+A read-only replay of 12 saved `ven-1f` DNGs found valid hole measurements in all
+samples. Frames 900, 950, 970 and 980 were within 3%; sampled shifted frames were
+7.2–19.4% below the target and would trigger the guard. The Pi also passed a hidden
+GUI smoke test with camera and motor access disabled.
+
+Physical nudge behavior still needs a short live trial across a known troublesome
+cut after flashing. Compare cropped frames, unnecessary pauses, correction count,
+and throughput before using it unattended on a whole reel.
+
+Recovery tests render moving film across several initial overshoots and pitch
+scales, check physical next-frame identity, and exercise missing holes, jams,
+disagreement, movement acknowledgements, stale exposures, stop requests, request
+ownership, counters and advance-send failures. The actual command-42 and Stop
+handlers also run in a C++ transport harness. Physical recovery still needs a
+live trial; these tests do not measure capstan slip or validate damaged-film tracking.

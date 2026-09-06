@@ -18,9 +18,9 @@ More info in README.md file
 #define __copyright__   "Copyright 2022-25, Juan Remirez de Esparza"
 #define __credits__     "Juan Remirez de Esparza"
 #define __license__     "MIT"
-#define __version__     "1.1.11"
-#define  __date__       "2025-06-08"
-#define  __version_highlight__  "Fallback to PT based film detection. Problem causing it to not work in VFD mode fixed."
+#define __version__     "1.1.13"
+#define  __date__       "2026-09-05"
+#define  __version_highlight__  "Bounded, acknowledged framing corrections while holding a PT-detected frame."
 #define __maintainer__  "Juan Remirez de Esparza"
 #define __email__       "jremirez@hotmail.com"
 #define __status__      "Development"
@@ -75,6 +75,7 @@ int UI_Command; // Stores I2C command from Raspberry PI --- ScanFilm=10 / Unlock
 #define CMD_ADVANCE_FRAME 41
 #define CMD_ADVANCE_FRAME_FRACTION 42
 #define CMD_RUN_FILM_COLLECTION 43
+#define CMD_ALIGN_FRAME 44
 #define CMD_SET_PT_LEVEL 50
 #define CMD_SET_MIN_FRAME_STEPS 52
 #define CMD_SET_FRAME_FINE_TUNE 54
@@ -104,6 +105,7 @@ int UI_Command; // Stores I2C command from Raspberry PI --- ScanFilm=10 / Unlock
 #define RSP_SCAN_ENDED 88
 #define RSP_FILM_FORWARD_ENDED 89
 #define RSP_ADVANCE_FRAME_FRACTION 90
+#define RSP_ALIGN_FRAME 91
 
 
 // Immutable values
@@ -183,6 +185,10 @@ boolean IsS8 = true;
 
 boolean TractionSwitchActive = false;  // When traction micro-switch is closed
 boolean TractionSwitchActiveLast = false;  // Last value of traction micro-switch, to detect changes
+boolean CaptureInProgress = false;     // Between telling RPi a frame is available and RPi asking for the next
+boolean RecoveryActive = false;        // Camera-guided seek using command 42, with collection held
+int RecoveryTravel = 0;
+                                       // one: film must not move, so outgoing film collection is suspended
 
 unsigned long StartFrameTime = 0;           // Time at which we get RPi command to get next frame (stats only)
 unsigned long StartPictureSaveTime = 0;     // Time at which we tell RPi to save current frame (stats only)
@@ -386,7 +392,7 @@ void loop() {
                 break;
             case CMD_SET_EXTRA_STEPS:
                 DebugPrint(">BoostPT", param);
-                if (param >= 1 && param <= 30)  // Also to move up we add extra steps
+                if (param >= 1 && param <= 150)  // Allow up to ~half frame advance for R8 alignment
                     FrameExtraSteps = param;
                 else if (param >= -30 && param <= -1)  // Manually force reduction of MinFrameSteps
                     FrameDeductSteps = param;
@@ -409,6 +415,9 @@ void loop() {
             case CMD_STOP_SCAN:
                 DebugPrintStr(">Scan stop");
                 FrameDetected = false;
+                CaptureInProgress = false;
+                RecoveryActive = false;
+                RecoveryTravel = 0;
                 LastFrameSteps = 0;
                 if (UVLedOn) {
                     analogWrite(11, 0); // Turn off UV LED
@@ -417,6 +426,34 @@ void loop() {
                 scan_process_ongoing = false;
                 SetReelsAsNeutral(HIGH, HIGH, HIGH);
                 ScanState = Sts_Idle;
+                break;
+            case CMD_ALIGN_FRAME:
+                // Zero probes support. High byte is a token (1..127); low byte
+                // is forward steps (1..40). Echo both, plus actual moved steps.
+                if (param == 32767) { // Separate capability query; preserves the old nudge probe.
+                    SendToRPi(RSP_ALIGN_FRAME, param, 2);
+                }
+                else if (param == 0) {
+                    SendToRPi(RSP_ALIGN_FRAME, 0, 1);
+                }
+                else {
+                    int steps = param & 255;
+                    int token = (param >> 8) & 127;
+                    if (param > 0 && token > 0 && steps >= 1 && steps <= 40 &&
+                        ScanState == Sts_Idle && CaptureInProgress && scan_process_ongoing &&
+                        !VFD_mode_active && !RecoveryActive && FrameStepsDone + steps <= MinFrameSteps / 3) {
+                        SetReelsAsNeutral(HIGH, LOW, LOW);
+                        digitalWrite(MotorB_Direction, HIGH);
+                        capstan_advance(steps);
+                        // Count this travel in the next PT detection interval;
+                        // otherwise its minimum-step gate could skip a hole.
+                        FrameStepsDone += steps;
+                        SendToRPi(RSP_ALIGN_FRAME, param, steps);
+                    }
+                    else {
+                        SendToRPi(RSP_ALIGN_FRAME, param, 0);
+                    }
+                }
                 break;
             case CMD_SET_AUTO_STOP:
                 DebugPrint(">Auto stop", param);
@@ -429,7 +466,8 @@ void loop() {
                 EndScanNotificationSent = true; // Prevent sending multiple times
                 SendToRPi(RSP_SCAN_ENDED, 0, 0);
             }
-            CollectOutgoingFilm();
+            if (!CaptureInProgress)  // Collecting tugs the film; do not do it while RPi is capturing
+                CollectOutgoingFilm();
         }
 
         switch (ScanState) {
@@ -459,6 +497,8 @@ void loop() {
                         SendToRPi(RSP_VERSION_ID, cnt_ver_1 * 256 + 1, cnt_ver_2 * 256 + cnt_ver_3);  // 1 - Arduino, 2 - RPi Pico
                         break;
                     case CMD_START_SCAN:
+                        if (RecoveryActive) break;
+                        CaptureInProgress = false;
                         tone(A2, 2000, 50); // Beep to indicate start of scanning
                         delay(100);     // Delay to avoind beep interfering with uv led PWB (both use same timer)
                         SetReelsAsNeutral(HIGH, LOW, LOW);
@@ -486,6 +526,12 @@ void loop() {
                         }
                         break;
                     case CMD_GET_NEXT_FRAME:  // Continue scan to next frame
+                        if (RecoveryActive) break; // Require an acknowledged recovery exit first.
+                        // A framing pause can outlast the no-film timer while the
+                        // film is stationary. Give detection a fresh transport interval.
+                        FilmDetectedTime = millis() + MaxFilmStallTime;
+                        NoFilmDetected = false;
+                        CaptureInProgress = false;
                         ScanState = Sts_Scan;
                         StartFrameTime = micros();
                         ScanSpeedDelay = OriginalScanSpeedDelay;
@@ -612,6 +658,40 @@ void loop() {
                             capstan_advance(MinFrameStepsR8);
                         break;
                     case CMD_ADVANCE_FRAME_FRACTION:
+                        // 401/402 enter/leave a held recovery session. Movement
+                        // still uses the existing positive step parameter.
+                        if (param == 401) {
+                            if (IsS8 && CaptureInProgress && scan_process_ongoing && !VFD_mode_active && !RecoveryActive) {
+                                RecoveryActive = true;
+                                RecoveryTravel = 0;
+                                FrameStepsDone = 0;
+                                SendToRPi(RSP_ADVANCE_FRAME_FRACTION, param, 1);
+                            }
+                            else SendToRPi(RSP_ADVANCE_FRAME_FRACTION, param, 0);
+                            break;
+                        }
+                        if (param == 402) {
+                            if (RecoveryActive) {
+                                RecoveryActive = false;
+                                // The camera has established a new frame origin.
+                                FrameStepsDone = 0;
+                                SendToRPi(RSP_ADVANCE_FRAME_FRACTION, param, 1);
+                            }
+                            else SendToRPi(RSP_ADVANCE_FRAME_FRACTION, param, 0);
+                            break;
+                        }
+                        if (RecoveryActive) {
+                            if (CaptureInProgress && scan_process_ongoing && param >= 1 && param <= 8 &&
+                                RecoveryTravel + param <= MinFrameStepsS8 * 5 / 4) {
+                                SetReelsAsNeutral(HIGH, LOW, LOW);
+                                digitalWrite(MotorB_Direction, HIGH);
+                                capstan_advance(param);
+                                RecoveryTravel += param;
+                                SendToRPi(RSP_ADVANCE_FRAME_FRACTION, param, 1);
+                            }
+                            else SendToRPi(RSP_ADVANCE_FRAME_FRACTION, param, 0);
+                            break;
+                        }
                         SetReelsAsNeutral(HIGH, LOW, LOW);
                         DebugPrint(">Advance frame", param);
                         // Parameter validation: Can be 5 or 20 for manual scan, allow 400 for VFD)
@@ -631,6 +711,7 @@ void loop() {
                         break;
                     case SCAN_FRAME_DETECTED:
                         ScanState = Sts_Idle; // Exit scan loop
+                        CaptureInProgress = true;
                         SendToRPi(RSP_FRAME_AVAILABLE, LastFrameSteps, LastPTLevel);
                         break;
                     case SCAN_TERMINATION_REQUESTED:
@@ -1093,7 +1174,7 @@ ScanResult scan(int UI_Command) {
 
         if (FrameDetected) {
             DebugPrintStr("Frame!");
-            if (Frame_Steps_Auto and FrameExtraSteps > 0)  // If auto steps enabled, and extra steps positive, aditional steps after detection
+            if (FrameExtraSteps > 0)  // Apply extra steps after detection (works in both auto and manual mode)
                 capstan_advance(FrameExtraSteps);
             LastFrameSteps = FrameStepsDone;
             adjust_framesteps(LastFrameSteps);
@@ -1272,4 +1353,3 @@ void SerialPrintStr(const char * str) {
 void SerialPrintInt(int i) {
     if (DebugState != DebugInfo) Serial.println(i);
 }
-
