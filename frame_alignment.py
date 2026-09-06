@@ -211,8 +211,10 @@ class ForwardRecovery:
                 if travel <= 0 or travel > self.pitch * 0.55:
                     return self.fail('Sprocket transition travel is inconsistent')
                 self.phase = 'next'
-            elif difference >= -0.0005 * travel:
-                return self.fail('Recovery movement did not move the same sprocket forward')
+            elif difference >= -0.00025 * travel:
+                return self.fail(
+                    f'Recovery progress too small: {-difference * measurement.height:.1f} px '
+                    f'(minimum {0.00025 * travel * measurement.height:.1f} px)')
             elif -difference > 0.02 + 0.007 * travel:
                 return self.fail('Sprocket position jumped unexpectedly')
         if offset is not None:
