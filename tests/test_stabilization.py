@@ -168,6 +168,63 @@ class CaptureIntegrationTests(unittest.TestCase):
         ns['pause_alignment_frame'].assert_called_once()
         ns['send_alignment_nudge'].assert_not_called()
 
+    def test_pause_off_keeps_comparison_and_evidence_without_pausing(self):
+        ns, requests = self.preflight(move=18)
+        ns['PauseOnCreep'] = False
+        self.assertFalse(ns['prepare_alignment_frame']())
+        self.assertTrue(ns['prepare_alignment_frame']())
+        ns['save_evidence'].assert_called_once()
+        ns['pause_alignment_frame'].assert_not_called()
+        self.assertIs(ns['alignment_request'], requests[0])
+
+    def test_pause_off_still_protects_overshoot_in_second_periodic_exposure(self):
+        ns, _ = self.preflight(move=-18)
+        ns['PauseOnCreep'] = False
+        ns['measure_hole'].side_effect = [HoleMeasurement(0, 768), HoleMeasurement(-100, 768)]
+        self.assertFalse(ns['prepare_alignment_frame']())
+        self.assertFalse(ns['prepare_alignment_frame']())
+        self.assertIn('outside alignment tolerance', ns['pause_alignment_frame'].call_args.args[0])
+
+    def test_measurement_off_uses_one_exposure_on_fifth_frame(self):
+        ns, requests = self.preflight(move=18)
+        ns.update(MeasureCreep=False, PauseOnCreep=False)
+        self.assertTrue(ns['prepare_alignment_frame']())
+        ns['capture_settled_request'].assert_called_once()
+        ns['save_evidence'].assert_not_called()
+        self.assertIs(ns['alignment_request'], requests[0])
+
+    def test_measurement_off_between_checks_reuses_first_without_second_capture(self):
+        ns, requests = self.preflight(move=18)
+        self.assertFalse(ns['prepare_alignment_frame']())
+        ns.update(MeasureCreep=False, PauseOnCreep=False)
+        self.assertTrue(ns['prepare_alignment_frame']())
+        ns['capture_settled_request'].assert_called_once()
+        self.assertIs(ns['alignment_request'], requests[0])
+        requests[0].release.assert_not_called()
+
+    def test_measurement_off_retains_sprocket_overshoot_confirmation(self):
+        ns, _ = self.preflight(move=-18, diagnostic=False)
+        ns.update(MeasureCreep=False, PauseOnCreep=False)
+        self.assertFalse(ns['prepare_alignment_frame']())
+        self.assertFalse(ns['prepare_alignment_frame']())
+        ns['pause_alignment_frame'].assert_called_once()
+        ns['save_evidence'].assert_not_called()
+        self.assertIsNone(ns['alignment_guard'].stabilization_first)
+
+    def test_measurement_toggle_disables_pause_and_stops_active_test_only(self):
+        for active in (None, StabilizationTest()):
+            ns = scanner_functions('cmd_measure_creep', measure_creep_var=Mock(get=Mock(return_value=False)),
+                pause_on_creep_var=Mock(), MeasureCreep=True, PauseOnCreep=True,
+                stabilization_test=active, ScanStopRequested=False, debug_menu=Mock(),
+                NORMAL='normal', DISABLED='disabled')
+            ns['cmd_measure_creep']()
+            self.assertFalse(ns['MeasureCreep'])
+            self.assertFalse(ns['PauseOnCreep'])
+            self.assertFalse(ns['ConfigData']['PauseOnCreep'])
+            self.assertFalse(ns['ConfigData']['MeasureCreep'])
+            self.assertEqual(ns['ScanStopRequested'], active is not None)
+            ns['pause_on_creep_var'].set.assert_called_once_with(False)
+
     def test_final_held_save_stops_without_advance(self):
         state = base.HeldFrameSaveTests().state()
         test = StabilizationTest(target=1)

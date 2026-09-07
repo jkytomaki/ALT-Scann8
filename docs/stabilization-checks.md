@@ -5,6 +5,19 @@ independent of Auto Fine Tune and alignment guard mode. Alignment confirmations
 also retain and compare their two exposures, including frames that are not on
 the five-frame interval. Each exposure must start after its settle deadline.
 
+Two independent controls are available in the **Debug** menu:
+
+- **Measure creep**: turn off to remove the periodic second exposure, picture
+  comparison and creep evidence writing. This also turns off and disables
+  **Pause on creep**. Normal captures and sprocket alignment/overshoot checks
+  remain active. Turning measurement back on leaves pausing off until selected.
+- **Pause on creep**: turn off to keep measurements and evidence without
+  pausing for periodic creep. The alignment guard still protects positions
+  outside its tolerance, including movement past the target during a pair.
+
+Both default to on and are included in saved settings. A stabilization test
+enables both; turning measurement off during a test requests a normal safe stop.
+
 The picture comparison uses six regions away from the sprocket and image
 borders. At least three textured regions spanning rows and columns must agree
 on translation, with a strong correlation after alignment. Sprocket coordinates
