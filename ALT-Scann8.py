@@ -113,6 +113,8 @@ from tooltip import Tooltips
 from rolling_average import RollingAverage
 from frame_alignment import AlignmentGuard, ForwardRecovery, HoleMeasurement, measure_hole
 from alignment_feedback import FineTuner, AlignmentStatistics
+from stabilization import ExposureSample, StabilizationTest, compare_exposures, save_evidence
+from stabilization_view import StabilizationComparison
 from alignment_statistics_view import AlignmentStatisticsWindow
 from proxy_jpeg import ProxyJpegWriter, capture_proxy_image
 from ntfy_notifications import NtfyNotifier
@@ -365,6 +367,9 @@ alignment_yolo_pending = None
 alignment_yolo_worker = YoloWorker()
 alignment_paused = False
 alignment_pause_dialog = None
+alignment_comparison = None
+stabilization_test = None
+stabilization_recheck = False
 alignment_guard_mode_var = None
 alignment_guard_tolerance_var = None
 alignment_status_var = None
@@ -1907,14 +1912,12 @@ def check_arrival_feedback(measurement, decision, attempts_before):
     first = alignment_guard.arrival_first
     if first is None:
         alignment_guard.arrival_first = measurement
-        sample = (fine_tune_availability() is None and (CurrentFrame + 1) % 5 == 0
-                  and measurement.offset is not None and measurement.source != 'yolo')
+        sample = stabilization_sample_due()
         if decision == 'confirm':
             alignment_guard.arrival_waiting = True
             return False
         if decision == 'accept' and sample:
-            record_alignment_arrival(measurement)
-            alignment_guard.arrival_recorded = True
+            # Wait for the picture comparison before using this stop to tune.
             alignment_guard.diagnostic_first = measurement
             return True
         record_alignment_arrival(measurement)
@@ -1931,9 +1934,9 @@ def check_arrival_feedback(measurement, decision, attempts_before):
     return False
 
 
-def finish_alignment_diagnostic(measurement=None, metadata=None, error=None):
-    """Log repeatability without changing tuning, motion or the accepted exposure."""
-    global alignment_guard
+def finish_alignment_diagnostic(measurement=None, metadata=None, error=None, request=None, strips=None):
+    """Check picture movement before saving the original accepted exposure."""
+    global alignment_guard, alignment_last_measurement
     first = alignment_guard.diagnostic_first
     first_metadata = alignment_request.get_metadata()
     comparable = (measurement is not None and first.offset is not None
@@ -1941,7 +1944,7 @@ def finish_alignment_diagnostic(measurement=None, metadata=None, error=None):
     delta = measurement.offset - first.offset if comparable else None
     delta_pct = 100 * delta / first.height if comparable else None
     pair = dict(frame=CurrentFrame + 1, run_id=alignment_statistics.run_id,
-                interval_frames=5, first_offset_px=first.offset,
+                interval_frames=1 if stabilization_test is not None else 5, first_offset_px=first.offset,
                 second_offset_px=measurement.offset if measurement else None,
                 delta_px=delta, delta_pct=delta_pct,
                 agrees=abs(delta_pct) <= 1.5 if comparable else None,
@@ -1956,9 +1959,144 @@ def finish_alignment_diagnostic(measurement=None, metadata=None, error=None):
     record.diagnostic = pair
     record.confirmed = record.confirmed or pair['agrees'] is True
     logging.info('Alignment diagnostic pair %s', json.dumps(pair, sort_keys=True))
+    if error or request is None:
+        record_stabilization_failure(error or 'Diagnostic exposure unavailable')
+        pause_alignment_frame(error or 'Diagnostic exposure unavailable')
+        return False
+    alignment_last_measurement = measurement
+    if finish_stabilization_pair(request, measurement, strips or {}):
+        return False
+    if alignment_comparison is None or alignment_comparison[2]['status'] == 'stable':
+        record_alignment_arrival(first, pair['agrees'] is True)
     alignment_guard = None
-    set_alignment_status('Diagnostic recorded; saving original exposure')
+    set_alignment_status('Repeat check recorded; saving original exposure')
     return True
+
+
+def stabilization_sample_due():
+    return stabilization_test is not None or stabilization_recheck or (CurrentFrame + 1) % 5 == 0
+
+
+def stabilization_sample(request, measurement, strips):
+    metadata = request.get_metadata()
+    keep = ('SensorTimestamp', 'ExposureTime', 'FrameDuration', 'AnalogueGain', 'DigitalGain', 'ColourGains')
+    return ExposureSample(request.make_image('main').convert('RGB').copy(),
+                          {key: metadata[key] for key in keep if key in metadata},
+                          measurement.offset, measurement.source, strips, StabilizationDelayValue)
+
+
+def record_stabilization_failure(reason):
+    if stabilization_test is not None and not stabilization_recheck:
+        stabilization_test.record(CurrentFrame + 1, dict(status='inconclusive', confident=False,
+            reason=reason, first=dict(settle_ms=StabilizationDelayValue)))
+
+
+def finish_stabilization_pair(request, measurement, strips):
+    """Return True only when movement pauses capture before any save or nudge."""
+    global alignment_comparison, last_frame_time
+    first = alignment_guard.stabilization_first
+    if first is None:
+        return False
+    second = stabilization_sample(request, measurement, strips)
+    result = compare_exposures(first, second)
+    result.update(frame=CurrentFrame + 1, run_id=alignment_statistics.run_id,
+                  recheck=stabilization_recheck, settings=alignment_settings())
+    alignment_guard.stabilization_first = None
+    if stabilization_test is not None and not stabilization_recheck:
+        stabilization_test.record(CurrentFrame + 1, result)
+        set_alignment_status(f'Stabilization test: {len(stabilization_test.records)}/50 checked')
+    logging.info('Stabilization comparison %s', json.dumps(result, sort_keys=True))
+    # Retain paired evidence for alignment errors too, even if picture detail
+    # agrees: both original overshoot checks must be available to investigate.
+    interesting = (result['status'] != 'stable' or alignment_guard.diagnostic_first is None)
+    if interesting:
+        try:
+            evidence = save_evidence(CurrentDir, alignment_statistics.run_id, CurrentFrame + 1,
+                                     first, second, result)
+        except (OSError, ValueError) as error:
+            logging.exception('Could not save stabilization evidence')
+            evidence = f'NOT SAVED: {error}'
+            alignment_comparison = (first, second, result, evidence)
+            pause_alignment_frame('Could not save comparison evidence; film remains held', second.image)
+            return True
+        alignment_comparison = (first, second, result, evidence)
+    # Analysis and writing lossless evidence are intentional held-frame work.
+    # Do not let their elapsed time trigger a synthetic frame-available event.
+    last_frame_time = time.time() + max_inactivity_delay - 2
+    if result['status'] == 'movement':
+        pause_alignment_frame(f"Picture moved {result['displacement_px']:.1f} px between post-delay exposures",
+                              second.image)
+        return True
+    # Inconclusive comparisons do not assert stability. Log/save them, retaining
+    # the existing framing guard's independent authority to pause.
+    return False
+
+
+def start_stabilization_test():
+    global stabilization_test
+    if ScanOngoing:
+        return
+    if SimulatedRun or CameraDisabled or FrameDetectMode != 'PFD':
+        tk.messagebox.showinfo('Stabilization test', 'Use a connected camera and PT frame detection for this test.')
+        return
+    stabilization_test = StabilizationTest()
+    start_scan()
+    if not ScanOngoing:
+        stabilization_test = None
+    else:
+        set_alignment_status('Stabilization test: checking every frame, up to 50 frames')
+
+
+def apply_stabilization_test_delay(value):
+    global StabilizationDelayValue
+    try:
+        delay = int(value)
+        if not 0 <= delay <= 1000:
+            raise ValueError()
+    except ValueError:
+        tk.messagebox.showerror('Stabilization delay', 'Enter a whole number from 0 to 1000 ms.')
+        return
+    StabilizationDelayValue = delay
+    ConfigData['CaptureStabilizationDelay'] = delay
+    stabilization_delay_value.set(delay)
+    set_alignment_status(f'Delay set to {delay} ms; test results apply to subsequent advances')
+
+
+def stop_completed_stabilization_test():
+    """Called after capture, before advance, including explicit held-frame saves."""
+    if stabilization_test is None or not stabilization_test.complete:
+        return False
+    ConfigData['CurrentFrame'] = str(CurrentFrame)
+    Scanned_Images_number.set(CurrentFrame)
+    stop_scan()
+    return True
+
+
+def finish_stabilization_test():
+    global stabilization_test
+    if stabilization_test is None:
+        return
+    summary = stabilization_test.summary()
+    stabilization_test = None
+    logging.info('Stabilization test summary %s', json.dumps(summary, sort_keys=True))
+    filename = os.path.join(CurrentDir, 'stabilization', alignment_statistics.run_id, 'summary.json')
+    try:
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        with open(filename, 'w') as output:
+            json.dump(summary, output, indent=2)
+    except OSError as error:
+        filename = f'Report not saved: {error}'
+        logging.exception('Could not save stabilization test report')
+    largest = summary['largest_displacement_px']
+    text = (f"Checked {summary['checked']} of {summary['target']} frames.\n"
+            f"Movement: {summary['movement']}; detection disagreements: {summary['detection_disagreements']}; "
+            f"inconclusive: {summary['inconclusive']}.\n"
+            f"Largest measured displacement: {f'{largest:.2f} px' if largest is not None else 'unknown'}.\n"
+            f"Delays tested (ms): {summary['delays_ms']}.\n"
+            'Movement threshold: 0.25% of image height (minimum 2 pixels).\n'
+            'Held-frame rechecks do not replace original arrival results.\n'
+            'No detected movement does not guarantee every frame is settled.\n' + filename)
+    tk.messagebox.showinfo('Stabilization test results', text)
 
 
 def is_frame_centered(img, film_type ='S8', compensate=True, threshold=10, slice_width=10):
@@ -2824,6 +2962,9 @@ def reset_alignment_guard():
     global alignment_guard, alignment_paused, alignment_pause_dialog, alignment_move_pending, alignment_move_result
     global alignment_yolo_pending
     global alignment_recovery, recovery_phase, recovery_pending, recovery_result, alignment_last_measurement
+    global alignment_comparison, stabilization_recheck
+    alignment_comparison = None
+    stabilization_recheck = False
     invalidate_phone_commands()
     alignment_recovery = None
     recovery_phase = None
@@ -2844,9 +2985,11 @@ def reset_alignment_guard():
 
 
 def retry_alignment_frame():
+    global stabilization_recheck
     if alignment_recovery is not None:
         return
     reset_alignment_guard()
+    stabilization_recheck = True
     set_alignment_status('Checking held frame')
     win.after(5, capture_loop)
 
@@ -2923,6 +3066,8 @@ def save_alignment_frame(continue_scan=False, recover=False):
     RetryingFrame = False
     counter_finished = (remaining.isdigit() and int(remaining) <= 1
                         and AutoStopEnabled and autostop_type.get() == 'counter_to_zero')
+    if stop_completed_stabilization_test():
+        return
     if continue_scan and not counter_finished and not ScanStopRequested:
         # A manual pause can outlast the watchdog. Give the next advance a
         # fresh interval before exposing an unpaused, guard-free scan state.
@@ -2964,6 +3109,16 @@ def pause_alignment_frame(reason, image=None):
     alignment_pause_dialog = tk.Toplevel(win)
     alignment_pause_dialog.title('Alignment paused')
     alignment_pause_dialog.transient(win)
+    if alignment_comparison is not None:
+        first, second, result, evidence = alignment_comparison
+        StabilizationComparison(alignment_pause_dialog, first.image, second.image, result, evidence).pack()
+        delay_controls = tk.Frame(alignment_pause_dialog)
+        delay_controls.pack(pady=4)
+        tk.Label(delay_controls, text='Delay for subsequent advances (ms):').pack(side=LEFT)
+        delay = tk.StringVar(delay_controls, str(StabilizationDelayValue))
+        tk.Entry(delay_controls, textvariable=delay, width=5).pack(side=LEFT)
+        tk.Button(delay_controls, text='Apply delay',
+                  command=lambda: apply_stabilization_test_delay(delay.get())).pack(side=LEFT)
     tk.Label(alignment_pause_dialog, text=(
         f'{filename} has not been saved. The film is held at this frame.\n\n{reason}\n\n'
         'Retry checks the same frame. Save uses the normal scan filename.\n'
@@ -2974,8 +3129,10 @@ def pause_alignment_frame(reason, image=None):
             wraplength=650).pack()
         tk.Button(alignment_pause_dialog, text='Save and find next frame',
                   command=save_alignment_frame_and_recover).pack(pady=8)
-    tk.Button(alignment_pause_dialog, text='Retry this frame', command=retry_alignment_frame).pack(side=LEFT, padx=16, pady=12)
-    tk.Button(alignment_pause_dialog, text='Save and continue', command=save_alignment_frame_and_continue).pack(side=LEFT, padx=8, pady=12)
+    tk.Button(alignment_pause_dialog, text='Recheck while held' if alignment_comparison else 'Retry this frame',
+              command=retry_alignment_frame).pack(side=LEFT, padx=16, pady=12)
+    tk.Button(alignment_pause_dialog, text='Save anyway and continue' if alignment_comparison else 'Save and continue',
+              command=save_alignment_frame_and_continue).pack(side=LEFT, padx=8, pady=12)
     tk.Button(alignment_pause_dialog, text='Save this frame and stop', command=save_alignment_frame_and_stop).pack(side=LEFT, padx=8, pady=12)
     tk.Button(alignment_pause_dialog, text='Stop without saving', command=stop_alignment_scan).pack(side=RIGHT, padx=16, pady=12)
     alignment_pause_dialog.protocol('WM_DELETE_WINDOW', stop_alignment_scan)
@@ -3031,11 +3188,14 @@ def prepare_alignment_frame():
     global alignment_move_pending, alignment_move_result
     global alignment_yolo_pending
     global alignment_last_measurement
+    global alignment_comparison
     if SimulatedRun or CameraDisabled:
         return True
-    if alignment_guard is None and AlignmentGuardMode == 'Off' and fine_tune_availability() is not None:
+    if (alignment_guard is None and AlignmentGuardMode == 'Off'
+            and fine_tune_availability() is not None and not stabilization_sample_due()):
         return True
     if alignment_guard is None:
+        alignment_comparison = None
         alignment_guard = AlignmentGuard(AlignmentGuardTolerance,
             correct=AlignmentGuardMode == 'Correct' and alignment_firmware_supported and FilmType == 'S8',
             steps_per_frame=FrameStepsS8 if FilmType == 'S8' else FrameStepsR8)
@@ -3060,6 +3220,7 @@ def prepare_alignment_frame():
         record.nudge_steps += moved
         CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME) + StabilizationDelayValue / 1000
     request = None
+    strips = {}
     try:
         if alignment_yolo_pending is not None:
             held, future, deadline, height = alignment_yolo_pending
@@ -3076,12 +3237,13 @@ def prepare_alignment_frame():
             if exposure_start < CaptureSettleDeadline:
                 if alignment_guard.diagnostic_first is not None:
                     return finish_alignment_diagnostic(error='Camera did not provide a settled diagnostic exposure')
+                record_stabilization_failure('Camera did not provide a settled exposure')
                 pause_alignment_frame('Camera did not provide a settled exposure')
                 return False
             image = request.make_array('main')
             height = image.shape[0]
             shift = FrameVCenterImageShift * height / PreviewHeight if PreviewHeight > 0 else FrameVCenterImageShift
-            measurement = measure_hole(image, FilmType, shift)
+            measurement = measure_hole(image, FilmType, shift, diagnostics=strips)
             if (measurement.offset is None and AlignmentGuardMode != 'Off'
                     and alignment_guard.diagnostic_first is None):
                 logging.info('Alignment fallback frame=%i source=%s reason=%s',
@@ -3098,7 +3260,7 @@ def prepare_alignment_frame():
                 set_alignment_status(f'Checking damaged sprocket on frame {CurrentFrame + 1}')
                 return False
         if alignment_guard.diagnostic_first is not None:
-            return finish_alignment_diagnostic(measurement, request.get_metadata())
+            return finish_alignment_diagnostic(measurement, request.get_metadata(), request=request, strips=strips)
         stage = ('after_nudge' if alignment_guard.attempts else
                  'confirmation' if alignment_guard.confirming or alignment_guard.arrival_waiting else 'initial')
         alignment_last_measurement = measurement
@@ -3110,6 +3272,9 @@ def prepare_alignment_frame():
                      None if measurement.offset is None else round(100 * measurement.offset / height, 3),
                      height, measurement.source, metadata.get('SensorTimestamp'),
                      metadata.get('ExposureTime'), measurement.reason)
+        if alignment_guard.stabilization_first is not None:
+            if finish_stabilization_pair(request, measurement, strips):
+                return False
         if alignment_guard.attempts:
             # Log before inspect() can replace last_offset/next_steps with the
             # starting point and size of another corrective move.
@@ -3122,6 +3287,7 @@ def prepare_alignment_frame():
         attempts_before = alignment_guard.attempts
         decision = 'accept' if AlignmentGuardMode == 'Off' else alignment_guard.inspect(measurement)
         if check_arrival_feedback(measurement, decision, attempts_before):
+            alignment_guard.stabilization_first = stabilization_sample(request, measurement, strips)
             CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME)
             alignment_request = request
             request = None  # Save this accepted exposure after the diagnostic completes.
@@ -3151,11 +3317,13 @@ def prepare_alignment_frame():
                 set_alignment_status(status)
             return True
         if decision == 'confirm':
+            alignment_guard.stabilization_first = stabilization_sample(request, measurement, strips)
             # Require another exposure of this same physical frame, not another film frame.
             CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME)
             set_alignment_status('Confirming alignment')
             return False
         if decision == 'nudge':
+            alignment_comparison = None  # Saved evidence remains on disk; this position is about to change.
             logging.info('Alignment nudge planned frame=%i nudge=%i steps=%i before_px=%s height_px=%i',
                          CurrentFrame + 1, alignment_guard.attempts, alignment_guard.next_steps,
                          measurement.offset, height)
@@ -3923,6 +4091,8 @@ def stop_scan():
     # Enable/Disable related buttons
     except_widget_global_enable([start_btn], not ScanOngoing)
 
+    finish_stabilization_test()
+
 
 def capture_loop():
     global win
@@ -3975,6 +4145,8 @@ def capture_loop():
                     win.after(10, capture_loop)
                 return
             recovered_frame_ready = True
+            if stabilization_test is not None:
+                record_stabilization_failure('Recovered frame had extra settling time; not a normal PT arrival')
             NewFrameAvailable = True
             scan_error_total_frames_counter += 1
             scan_error_counter_value.set(f'{scan_error_counter} ({scan_error_counter*100/scan_error_total_frames_counter:.1f}%)')
@@ -4082,6 +4254,8 @@ def capture_loop():
                 register_frame()
                 CurrentStill = 1
                 capture('normal')
+                if stop_completed_stabilization_test():
+                    return
             # On a retry (RetryingFrame) the frame was already captured and queued for
             # saving on the first attempt, so we do NOT capture again - that would queue a
             # second async save of the same filename. We only re-send the advance command.
@@ -4331,6 +4505,7 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
     global scan_error_counter, scan_error_total_frames_counter, scan_error_counter_value
     global steps_completed, steps_submitted
     global alignment_firmware_supported, alignment_move_result, recovery_firmware_supported
+    global stabilization_recheck
 
     # Paused guards end the capture callback chain. This independent listener
     # remains active, so service stop requests without scheduling another chain.
@@ -4404,6 +4579,7 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
             if not ExitingApp:
                 arduino_after = win.after(10, arduino_listen_loop)
             return
+        stabilization_recheck = False
         settings = alignment_settings()
         settings.update(reported_steps=ArduinoParam1, pt_raw=ArduinoParam2, pt_valid=0 <= ArduinoParam2 <= 1023)
         alignment_statistics.frame(CurrentFrame + 1, time.monotonic(), origin='pt', settings=settings)
@@ -7457,6 +7633,16 @@ def create_widgets():
         as_tooltips.add(stabilization_delay_spinbox, "Delay between frame detection and snapshot trigger. 100ms is a "
                                                      "good compromise, lower values might cause blurry captures.")
         stabilization_delay_spinbox.bind("<FocusOut>", lambda event: cmd_stabilization_delay_selection())
+
+        stabilization_test_btn = tk.Button(speed_quality_frame, text='Test stabilization (50 frames)',
+                                           command=start_stabilization_test, font=('Arial', FontSize - 2))
+        stabilization_test_btn.widget_type = 'general'
+        stabilization_test_btn.grid(row=2, column=0, columnspan=2, padx=x_pad, pady=y_pad, sticky='EW')
+        as_tooltips.add(stabilization_test_btn,
+                        'Start a normal scan with picture movement checks on every frame. '
+                        'Save stable frames normally and stop after 50 checked frames. '
+                        'Detected movement pauses before saving or advancing. '
+                        'Normal PT scanning checks every five frames.')
 
     if ExperimentalMode:
         experimental_frame = LabelFrame(extended_frame, text='Experimental Area', font=("Arial", FontSize - 1),

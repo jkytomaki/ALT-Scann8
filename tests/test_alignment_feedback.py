@@ -59,6 +59,7 @@ class ArrivalTests(unittest.TestCase):
     def preflight(self, measurements, mode='Off', frame=44):
         ns, requests = base.PreflightTests().preflight(measurements, mode)
         ns['CurrentFrame'] = frame
+        ns['stabilization_sample_due'].return_value = (frame + 1) % 5 == 0
         ns['alignment_statistics'].start(0)
         ns['alignment_statistics'].frame(frame + 1, 1, origin='pt')
         return ns, requests
@@ -66,12 +67,12 @@ class ArrivalTests(unittest.TestCase):
     def test_guard_off_collects_pair_without_pausing_or_nudging(self):
         ns, requests = self.preflight([HoleMeasurement(20, 1000), HoleMeasurement(22, 1000)])
         self.assertFalse(ns['prepare_alignment_frame']())
-        ns['adjust_auto_fine_tune'].assert_called_once()
+        ns['adjust_auto_fine_tune'].assert_not_called()
         self.assertTrue(ns['prepare_alignment_frame']())
         ns['pause_alignment_frame'].assert_not_called()
         ns['send_alignment_nudge'].assert_not_called()
         sample, confirmed, source = ns['adjust_auto_fine_tune'].call_args.args
-        self.assertFalse(confirmed)
+        self.assertTrue(confirmed)
         self.assertEqual(sample.offset, 20)
         ns['adjust_auto_fine_tune'].assert_called_once()
         self.assertEqual(ns['alignment_statistics'].records[45].diagnostic['delta_px'], 2)
@@ -121,7 +122,7 @@ class ArrivalTests(unittest.TestCase):
         self.assertIs(ns['alignment_request'], requests[0])
         requests[1].release.assert_called_once()
 
-    def test_failed_or_stale_diagnostic_preserves_original_accepted_request(self):
+    def test_failed_or_stale_diagnostic_pauses_before_saving(self):
         for failure in ('camera', 'stale'):
             ns, requests = self.preflight([HoleMeasurement(20, 1000)] * 2, 'Correct')
             ns['prepare_alignment_frame']()
@@ -129,8 +130,9 @@ class ArrivalTests(unittest.TestCase):
                 ns['capture_settled_request'].side_effect = RuntimeError('Camera test failure')
             else:
                 requests[1].get_metadata.return_value['SensorTimestamp'] = 0
-            self.assertTrue(ns['prepare_alignment_frame']())
-            ns['pause_alignment_frame'].assert_not_called()
+            self.assertFalse(ns['prepare_alignment_frame']())
+            ns['pause_alignment_frame'].assert_called_once()
+            ns['adjust_auto_fine_tune'].assert_not_called()
             self.assertIs(ns['alignment_request'], requests[0])
             self.assertIsNone(ns['alignment_statistics'].records[45].diagnostic['agrees'])
             requests[0].release.assert_not_called()

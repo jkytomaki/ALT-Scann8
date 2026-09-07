@@ -30,6 +30,10 @@ def scanner_functions(*names, **state):
               recovery_firmware_supported=False, alignment_last_measurement=None,
               alignment_statistics=AlignmentStatistics(), fine_tuner=FineTuner(),
               fine_tune_availability=Mock(return_value=None),
+              stabilization_test=None, stabilization_recheck=False, alignment_comparison=None,
+              stabilization_sample_due=Mock(return_value=False), stabilization_sample=Mock(),
+              finish_stabilization_pair=Mock(return_value=False), record_stabilization_failure=Mock(),
+              stop_completed_stabilization_test=Mock(return_value=False), finish_stabilization_test=Mock(),
               notify_scan_problem=Mock(), invalidate_phone_commands=Mock(),
               check_arrival_feedback=Mock(return_value=False), refresh_alignment_statistics=Mock())
     ns.update(state)

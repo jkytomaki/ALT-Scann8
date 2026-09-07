@@ -13,7 +13,7 @@ class HoleMeasurement:
     source: str = 'strips'
 
 
-def measure_hole(image, film_type, target_shift=0):
+def measure_hole(image, film_type, target_shift=0, diagnostics=None):
     """Require two independent strips to agree on a complete sprocket/gap.
 
     target_shift is in pixels of this image. Unknown measurements never mean
@@ -21,6 +21,8 @@ def measure_hole(image, film_type, target_shift=0):
     """
     height, width = image.shape[:2]
     centers = []
+    if diagnostics is not None:
+        diagnostics.update(target_shift=target_shift, strips=[])
     for fraction in (0.03, 0.04, 0.05):
         x = int(width * fraction)
         strip = image[:, x:x + max(2, round(width * 0.0025))]
@@ -29,12 +31,15 @@ def measure_hole(image, film_type, target_shift=0):
         gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
         if int(gray.max()) - int(gray.min()) < 20:
             continue
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        threshold, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         profile = np.mean(binary > 0, axis=1)
         mask = profile >= 0.5 if film_type == 'S8' else profile < 0.5
         edges = np.diff(np.r_[False, mask, False].astype(np.int8))
         areas = [(start, end) for start, end in zip(np.where(edges == 1)[0], np.where(edges == -1)[0])
                  if start > 0 and end < height and 0.08 * height < end - start < 0.8 * height]
+        if diagnostics is not None:
+            diagnostics['strips'].append(dict(x=x, width=strip.shape[1], threshold=threshold,
+                                              areas=[(int(a), int(b)) for a, b in areas]))
         if len(areas) != 1:
             continue
         start, end = areas[0]
@@ -48,11 +53,13 @@ def measure_hole(image, film_type, target_shift=0):
         pairs = [(a, b) for a, b in zip(centers, centers[1:]) if b - a <= agreement]
         centers = list(pairs[0]) if len(pairs) == 1 else []
     if len(centers) < 2:
-        return measure_adaptive_hole(image, film_type, target_shift)
+        return measure_adaptive_hole(image, film_type, target_shift, diagnostics)
+    if diagnostics is not None:
+        diagnostics['selected_centers'] = [float(c) for c in centers]
     return HoleMeasurement(float(np.median(centers)) - height / 2 - target_shift, height)
 
 
-def measure_adaptive_hole(image, film_type, target_shift=0):
+def measure_adaptive_hole(image, film_type, target_shift=0, diagnostics=None):
     """Find a clean interior band; require agreement on BOTH edges across it.
 
     Three non-overlapping strips spanning 1% of image width must support the
@@ -61,19 +68,25 @@ def measure_adaptive_hole(image, film_type, target_shift=0):
     """
     height, width = image.shape[:2]
     samples = []
+    if diagnostics is not None:
+        diagnostics['adaptive_strips'] = []
     for fraction in np.arange(0.005, 0.061, 0.005):
         x = round(width * fraction)
         strip = image[:, x:x + max(1, round(width * 0.0025))]
         gray = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY)
         areas = []
+        threshold = None
         if int(gray.max()) - int(gray.min()) >= 20:
-            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            threshold, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             mask = np.mean(binary > 0, axis=1) >= 0.5
             if film_type == 'R8':
                 mask = ~mask
             edges = np.diff(np.r_[False, mask, False].astype(np.int8))
             areas = [(a, b) for a, b in zip(np.where(edges == 1)[0], np.where(edges == -1)[0])
                      if 0 < a and b < height and 0.08 * height < b - a < 0.8 * height]
+        if diagnostics is not None:
+            diagnostics['adaptive_strips'].append(dict(x=x, width=strip.shape[1], threshold=threshold,
+                                                       areas=[(int(a), int(b)) for a, b in areas]))
         samples.append(areas[0] if len(areas) == 1 else None)
     supported = []
     for i in range(len(samples) - 2):
@@ -85,6 +98,8 @@ def measure_adaptive_hole(image, film_type, target_shift=0):
     if not supported or np.max(np.ptp(supported, axis=0)) > height * 0.015:
         return HoleMeasurement(None, height, 'No unambiguous complete sprocket detected', 'adaptive')
     start, end = np.median(supported, axis=0)
+    if diagnostics is not None:
+        diagnostics['adaptive_selected_edges'] = [float(start), float(end)]
     return HoleMeasurement(float((start + end - 1) / 2 - height / 2 - target_shift), height,
                            source='adaptive')
 
@@ -107,6 +122,7 @@ class AlignmentGuard:
         self.arrival_recorded = False
         self.arrival_waiting = False
         self.diagnostic_first = None
+        self.stabilization_first = None
 
     def inspect(self, measurement):
         offset, height = measurement.offset, measurement.height
