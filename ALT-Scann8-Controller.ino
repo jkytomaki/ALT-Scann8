@@ -18,9 +18,9 @@ More info in README.md file
 #define __copyright__   "Copyright 2022-25, Juan Remirez de Esparza"
 #define __credits__     "Juan Remirez de Esparza"
 #define __license__     "MIT"
-#define __version__     "1.1.13"
-#define  __date__       "2026-09-05"
-#define  __version_highlight__  "Bounded, acknowledged framing corrections while holding a PT-detected frame."
+#define __version__     "1.1.16"
+#define  __date__       "2026-09-07"
+#define  __version_highlight__  "PT tracking decay 2/6; retains guarded correction, recovery and capture hold."
 #define __maintainer__  "Juan Remirez de Esparza"
 #define __email__       "jremirez@hotmail.com"
 #define __status__      "Development"
@@ -954,9 +954,9 @@ int GetLevelPT() {
     MinPT = min(PT_SignalLevelRead, MinPT);
     MaxPT_Dynamic = max(PT_SignalLevelRead*10, MaxPT_Dynamic);
     MinPT_Dynamic = min(PT_SignalLevelRead*10, MinPT_Dynamic);
-    if (MaxPT_Dynamic > (MinPT_Dynamic+5)) MaxPT_Dynamic-=5;
+    if (MaxPT_Dynamic > (MinPT_Dynamic+2)) MaxPT_Dynamic-=2;
     //if (MinPT_Dynamic < MaxPT_Dynamic) MinPT_Dynamic+=int((MaxPT_Dynamic-MinPT_Dynamic)/10);  // need to catch up quickly for overexposed frames (proportional to MaxPT to adapt to any scanner)
-    if (MinPT_Dynamic < (MaxPT_Dynamic-15)) MinPT_Dynamic+=15;  // need to catch up quickly for overexposed frames (proportional to MaxPT to adapt to any scanner)
+    if (MinPT_Dynamic < (MaxPT_Dynamic-6)) MinPT_Dynamic+=6;  // need to catch up quickly for overexposed frames (proportional to MaxPT to adapt to any scanner)
     if (PT_Level_Auto && FrameStepsDone >= int((MinFrameSteps+FrameDeductSteps)*0.9)) {
         ratio = (float)PerforationThresholdAutoLevelRatio/100;
         fixed_margin = int((MaxPT_Dynamic-MinPT_Dynamic) * 0.1);

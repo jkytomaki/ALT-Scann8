@@ -2880,7 +2880,7 @@ def save_alignment_frame(continue_scan=False, recover=False):
     """Accept this position once, using the normal filename and capture path."""
     global CurrentFrame, CurrentStill, session_frames, FramesToGo
     global NewFrameAvailable, RetryingFrame, ScanStopRequested
-    global last_frame_time
+    global last_frame_time, recalculate_hdr_exp_list
     if not ScanOngoing or not alignment_paused or alignment_recovery is not None:
         return
     invalidate_phone_commands()
@@ -2895,6 +2895,9 @@ def save_alignment_frame(continue_scan=False, recover=False):
     except Exception as error:
         CurrentFrame = previous_frame
         session_frames -= 1
+        # A partial HDR bracket breaks the alternating-exposure continuity.
+        # Reinitialize and settle the first exposure before retrying this frame.
+        recalculate_hdr_exp_list = True
         ConfigData['CurrentFrame'] = str(CurrentFrame)
         logging.exception('Failed to capture held frame %s', CurrentFrame + 1)
         notify_scan_problem('save_failed', CurrentFrame + 1, str(error))
@@ -4328,6 +4331,11 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
     global scan_error_counter, scan_error_total_frames_counter, scan_error_counter_value
     global steps_completed, steps_submitted
     global alignment_firmware_supported, alignment_move_result, recovery_firmware_supported
+
+    # Paused guards end the capture callback chain. This independent listener
+    # remains active, so service stop requests without scheduling another chain.
+    if ScanOngoing and alignment_paused and ScanStopRequested:
+        capture_loop()
 
     if not SimulatedRun:
         try:
