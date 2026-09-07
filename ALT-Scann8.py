@@ -372,6 +372,8 @@ alignment_pause_dialog = None
 alignment_comparison = None
 stabilization_test = None
 stabilization_recheck = False
+PauseOnCreep = True
+MeasureCreep = True
 capture_beep_enabled = False  # Session-only diagnostic; always starts disabled.
 capture_beep_supported = False
 capture_beep_token = 0
@@ -1854,7 +1856,7 @@ def alignment_settings():
         steps_auto=AutoFrameStepsEnabled, steps=StepsPerFrame, extra_steps=FrameExtraStepsValue,
         speed=ScanSpeedValue, settle_ms=StabilizationDelayValue, film=FilmType,
         vcenter=FrameVCenterImageShift, resolution=CaptureResolution, capstan=CapstanDiameter,
-        detection=FrameDetectMode)
+        detection=FrameDetectMode, measure_creep=MeasureCreep, pause_on_creep=PauseOnCreep)
 
 
 def adjust_auto_fine_tune(measurement, confirmed, source):
@@ -1971,6 +1973,12 @@ def finish_alignment_diagnostic(measurement=None, metadata=None, error=None, req
     alignment_last_measurement = measurement
     if finish_stabilization_pair(request, measurement, strips or {}):
         return False
+    if (AlignmentGuardMode != 'Off' and measurement.offset is not None
+            and abs(measurement.offset) > measurement.height * AlignmentGuardTolerance / 100):
+        pause_alignment_frame('Repeat exposure is outside alignment tolerance '
+                              f'({100 * measurement.offset / measurement.height:+.1f}%)',
+                              request.make_image('main'))
+        return False
     if alignment_comparison is None or alignment_comparison[2]['status'] == 'stable':
         record_alignment_arrival(first, pair['agrees'] is True)
     alignment_guard = None
@@ -1979,7 +1987,29 @@ def finish_alignment_diagnostic(measurement=None, metadata=None, error=None, req
 
 
 def stabilization_sample_due():
-    return stabilization_test is not None or stabilization_recheck or (CurrentFrame + 1) % 5 == 0
+    return MeasureCreep and (stabilization_test is not None or stabilization_recheck or (CurrentFrame + 1) % 5 == 0)
+
+
+def cmd_pause_on_creep():
+    global PauseOnCreep
+    PauseOnCreep = MeasureCreep and pause_on_creep_var.get()
+    pause_on_creep_var.set(PauseOnCreep)
+    ConfigData['PauseOnCreep'] = PauseOnCreep
+    logging.info('Pause on periodic creep enabled=%s', PauseOnCreep)
+
+
+def cmd_measure_creep():
+    global MeasureCreep, PauseOnCreep, ScanStopRequested
+    MeasureCreep = measure_creep_var.get()
+    ConfigData['MeasureCreep'] = MeasureCreep
+    if not MeasureCreep:
+        PauseOnCreep = False
+        pause_on_creep_var.set(False)
+        ConfigData['PauseOnCreep'] = False
+        if stabilization_test is not None:
+            ScanStopRequested = True  # End the test through the normal safe stop path.
+    debug_menu.entryconfigure('Pause on creep', state=NORMAL if MeasureCreep else DISABLED)
+    logging.info('Creep measurement enabled=%s pause=%s', MeasureCreep, PauseOnCreep)
 
 
 def stabilization_sample(request, measurement, strips):
@@ -2005,7 +2035,7 @@ def finish_stabilization_pair(request, measurement, strips):
     second = stabilization_sample(request, measurement, strips)
     result = compare_exposures(first, second)
     result.update(frame=CurrentFrame + 1, run_id=alignment_statistics.run_id,
-                  recheck=stabilization_recheck, settings=alignment_settings())
+                  recheck=stabilization_recheck, settings=alignment_settings(), pause_on_creep=PauseOnCreep)
     alignment_guard.stabilization_first = None
     if stabilization_test is not None and not stabilization_recheck:
         stabilization_test.record(CurrentFrame + 1, result)
@@ -2028,7 +2058,8 @@ def finish_stabilization_pair(request, measurement, strips):
     # Analysis and writing lossless evidence are intentional held-frame work.
     # Do not let their elapsed time trigger a synthetic frame-available event.
     last_frame_time = time.time() + max_inactivity_delay - 2
-    if result['status'] == 'movement':
+    if result['status'] == 'movement' and (PauseOnCreep or stabilization_test is not None
+                                          or alignment_guard.diagnostic_first is None):
         pause_alignment_frame(f"Picture moved {result['displacement_px']:.1f} px between post-delay exposures",
                               second.image)
         return True
@@ -2038,12 +2069,17 @@ def finish_stabilization_pair(request, measurement, strips):
 
 
 def start_stabilization_test():
-    global stabilization_test
+    global stabilization_test, MeasureCreep, PauseOnCreep
     if ScanOngoing:
         return
     if SimulatedRun or CameraDisabled or FrameDetectMode != 'PFD':
         tk.messagebox.showinfo('Stabilization test', 'Use a connected camera and PT frame detection for this test.')
         return
+    MeasureCreep = PauseOnCreep = True
+    measure_creep_var.set(True)
+    pause_on_creep_var.set(True)
+    ConfigData.update(MeasureCreep=True, PauseOnCreep=True)
+    debug_menu.entryconfigure('Pause on creep', state=NORMAL)
     stabilization_test = StabilizationTest()
     start_scan()
     if not ScanOngoing:
@@ -3200,6 +3236,14 @@ def prepare_alignment_frame():
     if (alignment_guard is None and AlignmentGuardMode == 'Off'
             and fine_tune_availability() is not None and not stabilization_sample_due()):
         return True
+    if alignment_guard is not None and not MeasureCreep:
+        alignment_guard.stabilization_first = None
+        if alignment_guard.diagnostic_first is not None:
+            # Disabling between callbacks reuses the already accepted exposure;
+            # it must not request the now-disabled second periodic exposure.
+            record_alignment_arrival(alignment_guard.diagnostic_first)
+            alignment_guard = None
+            return True
     if alignment_guard is None:
         alignment_comparison = None
         alignment_guard = AlignmentGuard(AlignmentGuardTolerance,
@@ -3323,7 +3367,8 @@ def prepare_alignment_frame():
                 set_alignment_status(status)
             return True
         if decision == 'confirm':
-            alignment_guard.stabilization_first = stabilization_sample(request, measurement, strips)
+            if MeasureCreep:
+                alignment_guard.stabilization_first = stabilization_sample(request, measurement, strips)
             # Require another exposure of this same physical frame, not another film frame.
             CaptureSettleDeadline = time.clock_gettime(time.CLOCK_BOOTTIME)
             set_alignment_status('Confirming alignment')
@@ -4956,6 +5001,9 @@ def validate_config_folders():
 
 
 def load_config_data_pre_init():
+    global PauseOnCreep, MeasureCreep
+    MeasureCreep = ConfigData.get('MeasureCreep', True) is not False
+    PauseOnCreep = MeasureCreep and ConfigData.get('PauseOnCreep', True) is not False
     global AlignmentGuardMode, AlignmentGuardTolerance
     global ExpertMode, ExperimentalMode, PlotterEnabled, SimplifiedMode, UIScrollbars, DetectMisalignedFrames, MisalignedFrameTolerance, FontSize, DisableToolTips, BaseFolder
     global WidgetsEnabledWhileScanning, LogLevel, LoggingMode, ColorCodedButtons, TempInFahrenheit, LogLevel
@@ -6524,6 +6572,7 @@ def destroy_widgets(container, delete_top = False):
 
 def create_widgets():
     global capture_beep_var
+    global pause_on_creep_var, measure_creep_var, debug_menu
     global alignment_guard_mode_var, alignment_guard_tolerance_var, alignment_status_var
     global alignment_stats_button_var
     global win
@@ -6655,6 +6704,12 @@ def create_widgets():
     capture_beep_var = tk.BooleanVar(value=capture_beep_enabled)
     debug_menu.add_checkbutton(label='Capture beep (10 ms)', variable=capture_beep_var,
                                command=cmd_capture_beep)
+    measure_creep_var = tk.BooleanVar(value=MeasureCreep)
+    debug_menu.add_checkbutton(label='Measure creep', variable=measure_creep_var,
+                               command=cmd_measure_creep)
+    pause_on_creep_var = tk.BooleanVar(value=PauseOnCreep)
+    debug_menu.add_checkbutton(label='Pause on creep', variable=pause_on_creep_var,
+                               command=cmd_pause_on_creep, state=NORMAL if MeasureCreep else DISABLED)
 
     # Help Menu
     help_menu = tk.Menu(menu_bar, tearoff=0)
@@ -7484,7 +7539,7 @@ def create_widgets():
         if LoggingMode == 'DEBUG':
             qr_code_frame = LabelFrame(expert_frame, text="Debug Info", font=("Arial", FontSize - 1),
                                             name='qr_code_frame')
-            qr_code_frame.grid(row=1, rowspan=2, column=2, padx=x_pad, pady=y_pad, sticky='NSEW')
+            qr_code_frame.grid(row=1, rowspan=2, column=3, padx=x_pad, pady=y_pad, sticky='NSEW')
             qr_code_canvas = Canvas(qr_code_frame, bg='white', name='qr_code_canvas', width=1, height=1)
             qr_code_canvas.pack(side=TOP, expand=True, fill='both')
             qr_code_canvas.bind("<Button-1>", display_qr_code_info)
@@ -7497,7 +7552,7 @@ def create_widgets():
         # Frame to add frame align controls
         frame_alignment_frame = LabelFrame(expert_frame, text="Frame align", font=("Arial", FontSize - 1),
                                            name='frame_alignment_frame')
-        frame_alignment_frame.grid(row=0, column=2, padx=x_pad, pady=y_pad, sticky='EW')
+        frame_alignment_frame.grid(row=0, column=3, padx=x_pad, pady=y_pad, sticky='NEW')
         frame_align_row = 0
 
         # Spinbox to select MinFrameSteps on Arduino
@@ -7669,7 +7724,7 @@ def create_widgets():
         # Frame to add stabilization controls (speed & delay)
         speed_quality_frame = LabelFrame(expert_frame, text="Frame stabilization", font=("Arial", FontSize - 1),
                                          name='speed_quality_frame')
-        speed_quality_frame.grid(row=2, column=1, padx=x_pad, pady=y_pad, sticky='NSEW')
+        speed_quality_frame.grid(row=0, column=2, padx=x_pad, pady=y_pad, sticky='NEW')
 
         # Spinbox to select Speed on Arduino (1-10)
         scan_speed_label = tk.Label(speed_quality_frame, text='Scan Speed:', font=("Arial", FontSize - 1),
