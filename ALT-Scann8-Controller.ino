@@ -18,9 +18,9 @@ More info in README.md file
 #define __copyright__   "Copyright 2022-25, Juan Remirez de Esparza"
 #define __credits__     "Juan Remirez de Esparza"
 #define __license__     "MIT"
-#define __version__     "1.1.16"
+#define __version__     "1.1.17"
 #define  __date__       "2026-09-07"
-#define  __version_highlight__  "PT tracking decay 2/6; retains guarded correction, recovery and capture hold."
+#define  __version_highlight__  "Optional capture beep without UV timer changes; retains PT 2/6 and capture hold."
 #define __maintainer__  "Juan Remirez de Esparza"
 #define __email__       "jremirez@hotmail.com"
 #define __status__      "Development"
@@ -76,6 +76,7 @@ int UI_Command; // Stores I2C command from Raspberry PI --- ScanFilm=10 / Unlock
 #define CMD_ADVANCE_FRAME_FRACTION 42
 #define CMD_RUN_FILM_COLLECTION 43
 #define CMD_ALIGN_FRAME 44
+#define CMD_CAPTURE_BEEP 45
 #define CMD_SET_PT_LEVEL 50
 #define CMD_SET_MIN_FRAME_STEPS 52
 #define CMD_SET_FRAME_FINE_TUNE 54
@@ -106,7 +107,13 @@ int UI_Command; // Stores I2C command from Raspberry PI --- ScanFilm=10 / Unlock
 #define RSP_FILM_FORWARD_ENDED 89
 #define RSP_ADVANCE_FRAME_FRACTION 90
 #define RSP_ALIGN_FRAME 91
+#define RSP_CAPTURE_BEEP 92
 
+// Diagnostic pip: software-driven, so tone() cannot disturb UV PWM's timer.
+// The main loop keeps servicing transport, I2C and capture hold throughout.
+bool CaptureBeepActive = false;
+unsigned long CaptureBeepStarted = 0;
+bool CaptureBeepLevel = false;
 
 // Immutable values
 #define S8_HEIGHT  4.01
@@ -236,6 +243,35 @@ void SendToRPi(byte rsp, int param1, int param2)
 
 void(* resetFunc) (void) = 0;//declare reset function at address 0
 
+void ServiceCaptureBeep() {
+    if (!CaptureBeepActive) return;
+    unsigned long elapsed = micros() - CaptureBeepStarted;
+    if (elapsed >= 10000UL) {  // Fixed 10 ms; caller cannot request a long beep.
+        digitalWrite(A2, LOW);
+        CaptureBeepActive = false;
+        CaptureBeepLevel = false;
+        return;
+    }
+    bool level = (elapsed / 250UL) % 2 == 0;  // Approximately 2 kHz.
+    if (level != CaptureBeepLevel) {
+        digitalWrite(A2, level ? HIGH : LOW);
+        CaptureBeepLevel = level;
+    }
+}
+
+void CaptureBeepCommand(int token) {
+    if (token == 0) {
+        SendToRPi(RSP_CAPTURE_BEEP, 0, 1);  // Capability probe is silent.
+    } else if (token > 0) {
+        CaptureBeepStarted = micros();
+        CaptureBeepActive = true;
+        CaptureBeepLevel = true;
+        digitalWrite(A2, HIGH);
+        SendToRPi(RSP_CAPTURE_BEEP, token, 10);
+    }
+}
+
+
 void setup() {
     // Possible serial speeds: 1200, 2400, 4800, 9600, 19200, 38400, 57600,74880, 115200, 230400, 250000, 500000, 1000000, 2000000
     Serial.begin(1000000);  // As fast as possible for debug, otherwise it slows down execution
@@ -294,6 +330,7 @@ void loop() {
     SendToRPi(RSP_FORCE_INIT, 0, 0);  // Request UI to resend init sequence, in case controller reloaded while UI active
 
     while (1) {
+        ServiceCaptureBeep();
         if (dataInCmdQueue())
             UI_Command = pop_cmd(&param);   // Get next command from queue if one exists
         else
@@ -315,6 +352,9 @@ void loop() {
         */
 
         switch (UI_Command) {   // Stateless commands
+            case CMD_CAPTURE_BEEP:
+                CaptureBeepCommand(param);
+                break;
             case CMD_RESET_CONTROLLER:
                 resetFunc();
                 break;

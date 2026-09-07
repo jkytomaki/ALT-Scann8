@@ -34,6 +34,8 @@ def scanner_functions(*names, **state):
               stabilization_sample_due=Mock(return_value=False), stabilization_sample=Mock(),
               finish_stabilization_pair=Mock(return_value=False), record_stabilization_failure=Mock(),
               stop_completed_stabilization_test=Mock(return_value=False), finish_stabilization_test=Mock(),
+              capture_beep_enabled=False, capture_beep_supported=False,
+              mark_camera_capture=Mock(), capture_marked_image=Mock(),
               notify_scan_problem=Mock(), invalidate_phone_commands=Mock(),
               check_arrival_feedback=Mock(return_value=False), refresh_alignment_statistics=Mock())
     ns.update(state)

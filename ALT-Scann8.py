@@ -270,6 +270,7 @@ CMD_ADVANCE_FRAME = 41
 CMD_ADVANCE_FRAME_FRACTION = 42
 CMD_RUN_FILM_COLLECTION = 43
 CMD_ALIGN_FRAME = 44
+CMD_CAPTURE_BEEP = 45
 CMD_SET_PT_LEVEL = 50
 CMD_SET_MIN_FRAME_STEPS = 52
 CMD_SET_FRAME_FINE_TUNE = 54
@@ -300,6 +301,7 @@ RSP_SCAN_ENDED = 88
 RSP_FILM_FORWARD_ENDED = 89
 RSP_ADVANCE_FRAME_FRACTION = 90
 RSP_ALIGN_FRAME = 91
+RSP_CAPTURE_BEEP = 92
 
 # Options variables
 ExpertMode = True
@@ -370,6 +372,9 @@ alignment_pause_dialog = None
 alignment_comparison = None
 stabilization_test = None
 stabilization_recheck = False
+capture_beep_enabled = False  # Session-only diagnostic; always starts disabled.
+capture_beep_supported = False
+capture_beep_token = 0
 alignment_guard_mode_var = None
 alignment_guard_tolerance_var = None
 alignment_status_var = None
@@ -2413,7 +2418,7 @@ def cmd_single_step_movie():
             # Single step is not a critical operation, waiting 100ms for it to happen should be enough
             # No need to implement confirmation from Arduino, as we have for regular capture during scan
             time.sleep(0.5)
-            single_step_image = camera.capture_image("main")
+            single_step_image = capture_marked_image("main")
             draw_preview_image(single_step_image, 0, 0)
 
 
@@ -2817,7 +2822,7 @@ def capture_hdr(mode):
         perform_dry_run = True
         # For PiCamera2, preview and save to file are handled in asynchronous threads
         if HdrMergeInPlace and not is_dng:  # For now we do not even try to merge DNG images in place
-            captured_image = camera.capture_image("main")  # If merge in place, Capture snapshot (no DNG allowed)
+            captured_image = capture_marked_image("main")  # If merge in place, Capture snapshot (no DNG allowed)
             # Convert Pillow image to NumPy array
             img_np = np.array(captured_image)
             # Convert the NumPy array to a format suitable for MergeMertens (e.g., float32)
@@ -2827,6 +2832,7 @@ def capture_hdr(mode):
             if is_dng or is_png:  # If not using DNG we can still use multithread (if not disabled)
                 # DNG + HDR, save threads not possible due to request conflicting with retrieve metadata
                 request = camera.capture_request()
+                mark_camera_capture(request, 'hdr')
                 if CurrentFrame % PreviewModuleValue == 0:
                     captured_image = request.make_image('main')
                     # Display preview using thread, not directly
@@ -2847,7 +2853,7 @@ def capture_hdr(mode):
                 logging.debug(f"Capture hdr, saved request image ({CurrentFrame}, {idx}: "
                               f"{round((time.time() - curtime) * 1000, 1)}")
             else:
-                captured_image = camera.capture_image("main")
+                captured_image = capture_marked_image("main")
                 if NegativeImage:
                     captured_image = reverse_image(captured_image)
                 if DisableThreads:  # Save image in main loop
@@ -3501,6 +3507,54 @@ def prepare_recovery_frame():
     return False
 
 
+def cmd_capture_beep():
+    global capture_beep_enabled
+    requested = capture_beep_var.get()
+    if requested and not capture_beep_supported:
+        capture_beep_enabled = False
+        capture_beep_var.set(False)
+        tk.messagebox.showinfo('Capture beep', 'Capture beeps require the Nano capture-beep firmware (1.1.17).')
+        return
+    capture_beep_enabled = requested
+    logging.info('Capture beep debug enabled=%s', capture_beep_enabled)
+
+
+def mark_camera_capture(request, purpose='capture'):
+    """Mark a delivered exposure, not its earlier sensor exposure start.
+
+    Camera timestamps and host command time allow video alignment. Never beep
+    twice when a checked request is reused for saving, and never retry a pip.
+    """
+    global capture_beep_token
+    if not capture_beep_enabled or not capture_beep_supported or SimulatedRun or CameraDisabled:
+        return
+    try:
+        metadata = request.get_metadata()
+        capture_beep_token = capture_beep_token % 32767 + 1
+        sent_at = time.clock_gettime_ns(time.CLOCK_BOOTTIME)
+        sent = send_arduino_command(CMD_CAPTURE_BEEP, capture_beep_token)
+        sensor = metadata.get('SensorTimestamp')
+        exposure = metadata.get('ExposureTime')
+        logging.info('Capture beep token=%i purpose=%s current_frame=%i sensor_timestamp_ns=%s '
+                     'exposure_us=%s command_boottime_ns=%i delivery_lag_ms=%s sent=%s',
+                     capture_beep_token, purpose, CurrentFrame, sensor, exposure, sent_at,
+                     None if sensor is None else round((sent_at - sensor) / 1e6, 3), sent)
+    except Exception:
+        # Optional instrumentation must not leak a request or abort capture.
+        logging.exception('Could not mark camera capture with debug beep')
+
+
+def capture_marked_image(stream='main'):
+    if not capture_beep_enabled or not capture_beep_supported:
+        return camera.capture_image(stream)
+    request = camera.capture_request()
+    try:
+        mark_camera_capture(request, 'image')
+        return request.make_image(stream)
+    finally:
+        request.release()
+
+
 def take_alignment_request():
     global alignment_request
     if alignment_request is not None:
@@ -3511,7 +3565,7 @@ def take_alignment_request():
 
 def take_alignment_image():
     if alignment_request is None:
-        return camera.capture_image('main')
+        return capture_marked_image('main')
     request = take_alignment_request()
     try:
         return request.make_image('main')
@@ -3533,6 +3587,7 @@ def capture_settled_request():
         if exposure_start >= CaptureSettleDeadline:
             if rejected:
                 logging.debug(f"Settle guard: discarded {rejected} early frame(s) for frame {CurrentFrame}")
+            mark_camera_capture(request, 'settled')
             return request
         # Give up only once waiting longer cannot help: with the sensor free-running,
         # a frame exposed after the deadline must complete within about two frame
@@ -3757,7 +3812,7 @@ def capture(mode):
         if mode == 'still' or HdrCaptureActive or FileType not in ('dng', 'png'):
             time.sleep(StabilizationDelayValue/1000)
         if mode == 'still':
-            captured_image = camera.capture_image("main")
+            captured_image = capture_marked_image("main")
             captured_image.save(StillFrameFilenamePattern % (CurrentFrame, CurrentStill))
             CurrentStill += 1
         else:
@@ -4168,7 +4223,7 @@ def capture_loop():
                     steps_submitted = False
                     steps_completed = False
             time.sleep(0.05) # wait for film to settle (50 ms is enough, this is not the captured imnage, just to determine position)
-            sample_image = camera.capture_image("main")
+            sample_image = capture_marked_image("main")
             # Convert PIL Image to NumPy array (RGB -> BGR for cv2)
             image_np = np.array(sample_image)  # PIL gives RGB by default
             image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR
@@ -4506,6 +4561,7 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
     global steps_completed, steps_submitted
     global alignment_firmware_supported, alignment_move_result, recovery_firmware_supported
     global stabilization_recheck
+    global capture_beep_supported
 
     # Paused guards end the capture callback chain. This independent listener
     # remains active, so service stop requests without scheduling another chain.
@@ -4540,6 +4596,7 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
     if ArduinoTrigger == 0:  # Do nothing
         pass
     elif ArduinoTrigger == RSP_VERSION_ID:  # Version Id response
+        capture_beep_supported = False
         Controller_Id = ArduinoParam1%256
         if Controller_Id == 1:
             logging.info("Arduino controller detected")
@@ -4561,7 +4618,9 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
             recovery_firmware_supported = False
             if Controller_Id == 1:
                 send_arduino_command(CMD_ALIGN_FRAME, 0)
+                send_arduino_command(CMD_CAPTURE_BEEP, 0)
     elif ArduinoTrigger == RSP_FORCE_INIT:  # Controller reloaded, sent init sequence again
+        capture_beep_supported = False
         logging.debug("Controller requested to reinit")
         alignment_firmware_supported = False
         recovery_firmware_supported = False
@@ -4572,6 +4631,7 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
         reinit_controller()
         if Controller_Id == 1:
             send_arduino_command(CMD_ALIGN_FRAME, 0)
+            send_arduino_command(CMD_CAPTURE_BEEP, 0)
     elif ArduinoTrigger == RSP_FRAME_AVAILABLE:  # New Frame available
         if alignment_recovery is not None:
             pause_alignment_recovery('Unexpected PT frame event during recovery')
@@ -4641,6 +4701,13 @@ def arduino_listen_loop():  # Waits for Arduino communicated events and dispatch
         cmd_advance_movie(True)
     elif ArduinoTrigger == RSP_ALIGN_FRAME:
         receive_alignment_response(ArduinoParam1, ArduinoParam2)
+    elif ArduinoTrigger == RSP_CAPTURE_BEEP:
+        if ArduinoParam1 == 0:
+            capture_beep_supported = Controller_Id == 1 and ArduinoParam2 == 1
+            logging.info('Capture beep support: %s', capture_beep_supported)
+        else:
+            logging.info('Capture beep acknowledgement token=%i duration_ms=%i received_boottime_ns=%i',
+                         ArduinoParam1, ArduinoParam2, time.clock_gettime_ns(time.CLOCK_BOOTTIME))
     elif ArduinoTrigger == RSP_ADVANCE_FRAME_FRACTION:  
         if alignment_recovery is not None:
             receive_recovery_response(ArduinoParam1, ArduinoParam2)
@@ -6456,6 +6523,7 @@ def destroy_widgets(container, delete_top = False):
 
 
 def create_widgets():
+    global capture_beep_var
     global alignment_guard_mode_var, alignment_guard_tolerance_var, alignment_status_var
     global alignment_stats_button_var
     global win
@@ -6581,6 +6649,12 @@ def create_widgets():
     )
     file_menu.add_separator()
     file_menu.add_command(label="Exit", command=lambda: exit_app(True))
+
+    debug_menu = tk.Menu(menu_bar, tearoff=0)
+    menu_bar.add_cascade(label='Debug', menu=debug_menu)
+    capture_beep_var = tk.BooleanVar(value=capture_beep_enabled)
+    debug_menu.add_checkbutton(label='Capture beep (10 ms)', variable=capture_beep_var,
+                               command=cmd_capture_beep)
 
     # Help Menu
     help_menu = tk.Menu(menu_bar, tearoff=0)
