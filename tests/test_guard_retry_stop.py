@@ -23,6 +23,7 @@ class HdrRetryTests(unittest.TestCase):
                 for name in ('save_alignment_frame', 'capture_hdr'):
                     state.pop(name, None)
                 ns = scanner_functions('save_alignment_frame', 'capture_hdr', **state)
+                ns['ProxyJpegEnabled'] = False
                 ns['capture'] = ns['capture_hdr']
                 exposure = [10000 if previous_session == 2 else 40000]
                 events = []
